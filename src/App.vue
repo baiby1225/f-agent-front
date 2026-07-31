@@ -53,6 +53,7 @@ type RunSummary = {
   events?: RunEvent[]
   retry_of_run_id?: string | null
   attachments?: AttachmentSummary[]
+  artifacts?: RunArtifact[]
 }
 
 type ConversationTurn = {
@@ -68,8 +69,39 @@ type RunCreateResult = {
 }
 
 type RunArtifact = {
+  id: string
+  run_id: string
   kind: string
-  content?: { attachments?: AttachmentSummary[] }
+  title: string
+  content?: {
+    attachments?: AttachmentSummary[]
+    file?: {
+      filename: string
+      media_type: string
+      size: number
+      sha256: string
+      download_url: string
+    }
+    preview?: {
+      kind: string
+      sheet_name?: string
+      headers?: string[]
+      rows?: Array<Array<string | number | boolean | null>>
+      row_count?: number
+      text?: string
+      title?: string
+      sections?: Array<{
+        heading?: string
+        paragraphs?: string[]
+        bullets?: string[]
+        table?: {
+          headers?: string[]
+          rows?: Array<Array<string | number | boolean | null>>
+        }
+      }>
+    }
+  }
+  created_at: string
 }
 
 type RunResult = {
@@ -96,6 +128,16 @@ type RunEvent = {
   type: string
   occurred_at: string
   payload: Record<string, unknown>
+}
+
+type SourceCitation = {
+  id: string
+  citation_number: number
+  title: string
+  url: string
+  domain: string
+  snippet: string
+  provider: string
 }
 
 type ToolRequest = {
@@ -139,6 +181,12 @@ const submitError = ref('')
 const retryError = ref('')
 const isSubmitting = ref(false)
 const isRetrying = ref(false)
+const isStopping = ref(false)
+const editingRunId = ref('')
+const editingQuestion = ref('')
+const editError = ref('')
+const copiedRunId = ref('')
+const copiedAnswerRunId = ref('')
 const approvalKey = ref('')
 const approvalError = ref('')
 const approvalBusy = ref(false)
@@ -146,8 +194,14 @@ const activeRunId = ref('')
 const activeRun = ref<RunSummary | null>(null)
 const eventSource = ref<EventSource | null>(null)
 const messageScroll = ref<HTMLElement | null>(null)
+const reasoningScroll = ref<HTMLElement | null>(null)
+const reasoningAutoFollow = ref(true)
 const typedAnswer = ref('')
+const answerTarget = ref('')
+const renderedAnswer = ref('')
 const isTyping = ref(false)
+const answerStreamCompleted = ref(false)
+const answerPlaybackCompleted = ref(false)
 const reasoningText = ref('')
 const isReasoning = ref(false)
 const reasoningExpanded = ref(true)
@@ -161,7 +215,18 @@ const compactSidebarDefault = typeof window !== 'undefined'
   && window.matchMedia('(max-width: 1020px)').matches
 const sessionsCollapsed = ref(readCollapsedPreference(SESSIONS_COLLAPSED_KEY, compactSidebarDefault))
 const executionCollapsed = ref(readCollapsedPreference(EXECUTION_COLLAPSED_KEY, compactSidebarDefault))
+const sidebarMode = ref<'trace' | 'preview' | 'sources'>('trace')
+const selectedArtifact = ref<RunArtifact | null>(null)
+const sourcePanelCitations = ref<SourceCitation[]>([])
+const selectedCitation = ref<SourceCitation | null>(null)
+const TYPEWRITER_INTERVAL_MS = 20
+const FIRST_ANSWER_DELAY_MS = 150
+const MARKDOWN_RENDER_INTERVAL_MS = 42
 let clockTimer: number | undefined
+let typewriterTimer: number | undefined
+let markdownRenderTimer: number | undefined
+let typewriterScrollTick = 0
+let eventQueue: Promise<void> = Promise.resolve()
 
 const conversationGroups = computed<ConversationGroup[]>(() => {
   const dayMilliseconds = 24 * 60 * 60 * 1000
@@ -200,6 +265,19 @@ const markdown = new MarkdownIt({
   linkify: true,
   typographer: false,
 })
+const defaultLinkOpen = markdown.renderer.rules.link_open
+markdown.renderer.rules.link_open = (tokens, index, options, env, self) => {
+  const label = tokens[index + 1]?.type === 'text'
+    ? tokens[index + 1].content.trim()
+    : ''
+  if (/^\d{1,3}$/.test(label)) {
+    tokens[index].attrJoin('class', 'citation-link')
+    tokens[index].attrSet('aria-label', `查看来源 ${label}`)
+  }
+  return defaultLinkOpen
+    ? defaultLinkOpen(tokens, index, options, env, self)
+    : self.renderToken(tokens, index, options)
+}
 DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   if (node instanceof HTMLAnchorElement) {
     node.setAttribute('target', '_blank')
@@ -222,18 +300,60 @@ const activeAgent = computed(() => agents.value.find(
 const hasClipboardTable = computed(() => Boolean(tableText.value.trim() || tableHtml.value.trim()))
 const hasTable = computed(() => hasClipboardTable.value || attachments.value.length > 0)
 const pasteRowCount = computed(() => tableText.value.split(/\r?\n/).filter((line) => line.trim()).length)
+const isRunActive = computed(() => ['pending', 'running', 'waiting_approval'].includes(
+  activeRun.value?.status || '',
+))
+const isResponseActive = computed(() => (
+  isRunActive.value || isReasoning.value || isTyping.value
+))
 const canSubmit = computed(() => Boolean(question.value.trim())
-  && !isSubmitting.value)
+  && !isSubmitting.value
+  && !isResponseActive.value)
 const visibleProgressEvents = computed(() => events.value.filter((event) => (
-  event.type !== 'message.delta' && event.type !== 'message.reasoning.delta'
+  event.type !== 'message.delta'
+  && event.type !== 'message.reasoning.delta'
+  && event.type !== 'citation.created'
 )))
 const processSteps = computed(() => buildProcessSteps(visibleProgressEvents.value, activeRun.value?.status || ''))
 const processProgressText = computed(() => {
   const completed = processSteps.value.filter((step) => step.status === 'done').length
   return processSteps.value.length ? `${completed}/${processSteps.value.length} 已完成` : '准备执行'
 })
-const renderedAnswer = computed(() => renderMarkdown(typedAnswer.value))
+const showActiveArtifacts = computed(() => {
+  const status = activeRun.value?.status || ''
+  if (status === 'failed' || status === 'cancelled') return true
+  return status === 'completed' && answerPlaybackCompleted.value
+})
+const activeProcessStep = computed(() => (
+  [...processSteps.value].reverse().find((step) => step.status === 'active')
+))
+const isPreparingResponse = computed(() => (
+  ['pending', 'running'].includes(activeRun.value?.status || '')
+  && !reasoningText.value
+  && !isReasoning.value
+  && !typedAnswer.value
+  && !isTyping.value
+))
+const preparingResponseTitle = computed(() => (
+  activeProcessStep.value?.title || '正在准备处理你的请求'
+))
+const preparingResponseDetail = computed(() => (
+  activeProcessStep.value?.detail || '正在创建执行上下文，请稍候'
+))
 const renderedReasoning = computed(() => renderMarkdown(reasoningText.value))
+const selectedArtifactFile = computed(() => selectedArtifact.value?.content?.file)
+const selectedArtifactPreview = computed(() => selectedArtifact.value?.content?.preview)
+const activeCitations = computed(() => citationsFromEvents(events.value))
+const sidebarEyebrow = computed(() => ({
+  trace: 'AGENT TRACE',
+  preview: 'FILE PREVIEW',
+  sources: 'WEB SOURCES',
+}[sidebarMode.value]))
+const sidebarTitle = computed(() => ({
+  trace: '执行轨迹',
+  preview: '文件预览',
+  sources: '引用网页',
+}[sidebarMode.value]))
 const reasoningElapsedText = computed(() => formatElapsed(
   Math.max(0, (isReasoning.value ? clockNow.value : reasoningEndedAt.value || clockNow.value)
     - (reasoningStartedAt.value || clockNow.value)),
@@ -287,6 +407,7 @@ const runStatusText = computed(() => {
     waiting_approval: '等待审批',
     completed: '已完成',
     failed: '执行失败',
+    cancelled: '已停止',
   }
   return labels[activeRun.value?.status || ''] || '空闲'
 })
@@ -317,8 +438,54 @@ function toggleExecution(): void {
   window.localStorage.setItem(EXECUTION_COLLAPSED_KEY, String(executionCollapsed.value))
 }
 
+function openArtifactPreview(artifact: RunArtifact): void {
+  selectedArtifact.value = artifact
+  sidebarMode.value = 'preview'
+  executionCollapsed.value = false
+  window.localStorage.setItem(EXECUTION_COLLAPSED_KEY, 'false')
+}
+
+function openCitationSources(
+  citations: SourceCitation[],
+  selectedUrl = '',
+): void {
+  if (!citations.length) return
+  sourcePanelCitations.value = citations
+  selectedCitation.value = citations.find((citation) => sameUrl(citation.url, selectedUrl))
+    || citations[0]
+    || null
+  sidebarMode.value = 'sources'
+  executionCollapsed.value = false
+  window.localStorage.setItem(EXECUTION_COLLAPSED_KEY, 'false')
+}
+
+function openRunCitations(run: RunSummary): void {
+  openCitationSources(runCitations(run))
+}
+
+function handleCitationClick(event: MouseEvent, run?: RunSummary): void {
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const anchor = target.closest<HTMLAnchorElement>('a.citation-link')
+  if (!anchor) return
+  const citations = run ? runCitations(run) : activeCitations.value
+  const citation = citations.find((item) => sameUrl(item.url, anchor.href))
+  if (!citation) return
+  event.preventDefault()
+  openCitationSources(citations, citation.url)
+}
+
+function selectCitation(citation: SourceCitation): void {
+  selectedCitation.value = citation
+}
+
+function showExecutionTrace(): void {
+  sidebarMode.value = 'trace'
+}
+
 onBeforeUnmount(() => {
   closeEventSource()
+  stopAnswerTimers()
   if (clockTimer !== undefined) window.clearInterval(clockTimer)
 })
 
@@ -359,7 +526,13 @@ async function selectConversation(id: string) {
   toolRequests.value = []
   approvalError.value = ''
   retryError.value = ''
+  isStopping.value = false
+  cancelEditing()
   activeRun.value = null
+  selectedArtifact.value = null
+  sourcePanelCitations.value = []
+  selectedCitation.value = null
+  sidebarMode.value = 'trace'
   resetTypewriter()
   const detail = await apiGet<{
     messages: Message[]
@@ -569,6 +742,10 @@ async function submitRun() {
     )
     if (currentConversation) currentConversation.title = response.conversation_title
     activeRunId.value = response.run_id
+    selectedArtifact.value = null
+    sourcePanelCitations.value = []
+    selectedCitation.value = null
+    sidebarMode.value = 'trace'
     const pendingRun: RunSummary = {
       id: response.run_id,
       status: 'pending',
@@ -600,6 +777,153 @@ async function submitRun() {
     submitError.value = error instanceof Error ? error.message : '提交失败，请稍后重试。'
   } finally {
     isSubmitting.value = false
+  }
+}
+
+async function rerunRun(sourceRun: RunSummary, revisedQuestion?: string) {
+  if (isRetrying.value || isResponseActive.value) return
+  const submittedQuestion = (revisedQuestion ?? sourceRun.question).trim()
+  if (!submittedQuestion) {
+    editError.value = '问题内容不能为空。'
+    return
+  }
+  isRetrying.value = true
+  retryError.value = ''
+  editError.value = ''
+  try {
+    const response = await apiPost<RunCreateResult>(
+      `/api/runs/${sourceRun.id}/rerun`,
+      { question: submittedQuestion },
+    )
+    const currentConversation = conversations.value.find(
+      (conversation) => conversation.id === response.conversation_id,
+    )
+    if (currentConversation) currentConversation.title = response.conversation_title
+    activeRunId.value = response.run_id
+    selectedArtifact.value = null
+    sourcePanelCitations.value = []
+    selectedCitation.value = null
+    sidebarMode.value = 'trace'
+    const pendingRun: RunSummary = {
+      id: response.run_id,
+      status: 'pending',
+      question: submittedQuestion,
+      agent_key: sourceRun.agent_key,
+      created_at: new Date().toISOString(),
+      events: [],
+      attachments: sourceRun.attachments || [],
+    }
+    activeRun.value = pendingRun
+    runs.value = [pendingRun, ...runs.value]
+    messages.value.push({
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: submittedQuestion,
+      created_at: new Date().toISOString(),
+      extra: { run_id: response.run_id },
+    })
+    events.value = []
+    toolRequests.value = []
+    approvalError.value = ''
+    cancelEditing()
+    resetTypewriter()
+    connectEvents(response.run_id)
+    await scrollMessagesToBottom(true)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '重新生成失败，请稍后重试。'
+    if (editingRunId.value === sourceRun.id) editError.value = message
+    else retryError.value = message
+  } finally {
+    isRetrying.value = false
+  }
+}
+
+async function cancelActiveRun() {
+  const run = activeRun.value
+  if (!run || !isResponseActive.value || isStopping.value) return
+  const shouldCancelBackend = isRunActive.value
+  isStopping.value = true
+  submitError.value = ''
+
+  // 点击后立即冻结可见内容；后端取消不应成为停止按钮的视觉延迟。
+  freezeCurrentAnswer()
+  finishReasoning()
+  closeEventSource()
+
+  if (!shouldCancelBackend) {
+    isStopping.value = false
+    return
+  }
+
+  try {
+    await apiPost(`/api/runs/${run.id}/cancel`, {})
+    if (activeRun.value?.id === run.id) activeRun.value.status = 'cancelled'
+    await refreshRun(run.id, false, true)
+    await Promise.all([
+      loadConversations(),
+      refreshConversationContent(selectedConversationId.value),
+    ])
+  } catch (error) {
+    try {
+      // 请求期间任务可能已经自然完成；保留用户刚刚停止的位置，只刷新真实状态。
+      await refreshRun(run.id, false, true)
+      if (isRunActive.value) {
+        submitError.value = error instanceof Error ? error.message : '停止生成失败，请稍后重试。'
+        connectEvents(run.id)
+      }
+    } catch {
+      submitError.value = error instanceof Error ? error.message : '停止生成失败，请稍后重试。'
+      connectEvents(run.id)
+    }
+  } finally {
+    isStopping.value = false
+  }
+}
+
+function freezeCurrentAnswer() {
+  stopAnswerTimers()
+  answerTarget.value = typedAnswer.value
+  answerStreamCompleted.value = true
+  answerPlaybackCompleted.value = true
+  isTyping.value = false
+  scheduleMarkdownRender(true)
+}
+
+function isTerminalRun(run: RunSummary): boolean {
+  return ['completed', 'failed', 'cancelled'].includes(run.status)
+}
+
+function startEditing(run: RunSummary) {
+  editingRunId.value = run.id
+  editingQuestion.value = run.question
+  editError.value = ''
+}
+
+function cancelEditing() {
+  editingRunId.value = ''
+  editingQuestion.value = ''
+  editError.value = ''
+}
+
+async function submitEditedRun(run: RunSummary) {
+  await rerunRun(run, editingQuestion.value)
+}
+
+function handleEditKeydown(event: KeyboardEvent, run: RunSummary) {
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return
+  event.preventDefault()
+  if (!isRetrying.value) void submitEditedRun(run)
+}
+
+async function copyRunQuestion(run: RunSummary) {
+  try {
+    await navigator.clipboard.writeText(run.question)
+    copiedRunId.value = run.id
+    window.setTimeout(() => {
+      if (copiedRunId.value === run.id) copiedRunId.value = ''
+    }, 1500)
+  } catch {
+    window.alert('复制失败，请手动选择问题文本。')
   }
 }
 
@@ -648,13 +972,15 @@ function connectEvents(runId: string) {
   closeEventSource()
   const source = new EventSource(`/api/runs/${runId}/events`)
   eventSource.value = source
-  source.onmessage = (message) => appendEvent(message.data)
+  source.onmessage = (message) => enqueueRunEvent(message.data)
   // 服务端发送了具名 SSE 事件，必须逐类监听；onmessage 仅兼容默认事件。
   const names = [
     'run.started',
     'run.progress',
     'message.reasoning.delta',
     'message.delta',
+    'citation.created',
+    'artifact.created',
     'tool.started',
     'tool.completed',
     'approval.required',
@@ -662,17 +988,28 @@ function connectEvents(runId: string) {
     'input.required',
     'run.completed',
     'run.failed',
+    'run.cancelled',
   ]
   for (const name of names) {
-    source.addEventListener(name, (message) => appendEvent((message as MessageEvent).data))
+    source.addEventListener(name, (message) => enqueueRunEvent((message as MessageEvent).data))
   }
+}
+
+function enqueueRunEvent(raw: string) {
+  // EventSource 回调不能 await；显式排队可保证完成事件不会越过前面的文本分片。
+  eventQueue = eventQueue
+    .then(() => appendEvent(raw))
+    .catch((error) => {
+      console.error('处理运行事件失败', error)
+    })
 }
 
 async function appendEvent(raw: string) {
   const event = JSON.parse(raw) as RunEvent
   if (event.run_id !== activeRunId.value) return
-  // SSE 重连可能补发历史事件，以 sequence 去重后再追加到内嵌执行轨迹。
-  if (!events.value.some((item) => item.sequence === event.sequence)) {
+  // SSE 重连可能补发历史事件；重复终态事件也不能再次刷新并打断播放。
+  const isNewEvent = !events.value.some((item) => item.sequence === event.sequence)
+  if (isNewEvent) {
     events.value.push(event)
     if (event.type === 'run.started' && activeRun.value) {
       activeRun.value.status = 'running'
@@ -685,25 +1022,50 @@ async function appendEvent(raw: string) {
       await refreshRun(event.run_id, false)
     }
     if (event.type === 'message.delta') {
-      finishReasoning(event.occurred_at)
-      enqueueAnswerChunk(String(event.payload.content || ''))
+      const content = String(event.payload.content || '')
+      if (String(event.payload.stage || '') === 'final') {
+        finishReasoning(event.occurred_at)
+        enqueueAnswerChunk(content)
+      } else {
+        // 兼容旧后端：非 final 的普通文本仍属于多轮思考，不能启动最终答复。
+        enqueueReasoningChunk(content, event.occurred_at)
+      }
     }
     if (event.type === 'message.reasoning.delta') {
       enqueueReasoningChunk(String(event.payload.content || ''), event.occurred_at)
     }
+    if (event.type === 'artifact.created') {
+      const artifact = event.payload.artifact as RunArtifact | undefined
+      if (artifact?.id && activeRun.value) {
+        activeRun.value.artifacts = mergeRunArtifacts(activeRun.value.artifacts || [], [artifact])
+      }
+      const run = runs.value.find((item) => item.id === event.run_id)
+      if (artifact?.id && run) {
+        run.artifacts = mergeRunArtifacts(run.artifacts || [], [artifact])
+      }
+    }
   }
+  if (!isNewEvent) return
   await scrollMessagesToBottom()
-  if (event.type === 'run.completed' || event.type === 'run.failed') {
+  if (event.type === 'run.completed' || event.type === 'run.failed' || event.type === 'run.cancelled') {
     const conversationId = selectedConversationId.value
-    isTyping.value = false
+    const wasCancelled = event.type === 'run.cancelled'
+    if (activeRun.value) activeRun.value.status = wasCancelled ? 'cancelled' : activeRun.value.status
+    if (wasCancelled) {
+      freezeCurrentAnswer()
+    } else {
+      answerStreamCompleted.value = true
+      completeAnswerPlayback()
+    }
     finishReasoning(event.occurred_at)
     closeEventSource()
-    await refreshRun(event.run_id, true)
+    await refreshRun(event.run_id, !wasCancelled, wasCancelled)
     await Promise.all([loadConversations(), refreshConversationContent(conversationId)])
+    if (wasCancelled) isStopping.value = false
   }
 }
 
-async function refreshRun(runId: string, animateAnswer = true) {
+async function refreshRun(runId: string, animateAnswer = true, preservePartialAnswer = false) {
   // 从持久化接口恢复最终结果及完整事件，确保刷新页面后仍可复查。
   const detail = await apiGet<{
     run: RunSummary
@@ -719,6 +1081,11 @@ async function refreshRun(runId: string, animateAnswer = true) {
     content_type: item.content_type,
     file_size: item.file_size,
   }))
+  const liveArtifacts = activeRun.value?.id === runId ? activeRun.value.artifacts || [] : []
+  detail.run.artifacts = mergeRunArtifacts(
+    liveArtifacts,
+    (detail.artifacts || []).filter((artifact) => artifact.kind === 'generated-file'),
+  )
   activeRun.value = detail.run
   toolRequests.value = detail.tool_requests || []
   events.value = detail.events.map((event) => ({
@@ -729,7 +1096,13 @@ async function refreshRun(runId: string, animateAnswer = true) {
     occurred_at: event.occurred_at,
     payload: event.payload,
   })) as RunEvent[]
-  setAnswerTarget(String(detail.run.result?.answer || ''), animateAnswer)
+  const persistedAnswer = String(detail.run.result?.answer || '')
+  const recoveredAnswer = persistedAnswer || answerFromEvents(events.value)
+  if (preservePartialAnswer && typedAnswer.value) {
+    freezeCurrentAnswer()
+  } else {
+    setAnswerTarget(recoveredAnswer, animateAnswer)
+  }
   restoreReasoning(detail.run, events.value)
   await scrollMessagesToBottom()
 }
@@ -760,11 +1133,68 @@ async function decideToolRequest(action: 'approve' | 'reject') {
 }
 function enqueueAnswerChunk(content: string) {
   if (!content) return
-  // message.delta 始终是后端真实产生的新增文本；兼容旧版累计全文事件。
-  typedAnswer.value = content.startsWith(typedAnswer.value)
+  const firstChunk = !answerTarget.value && !typedAnswer.value
+  // 兼容真实增量事件和旧版累计全文事件，始终只维护一份 Markdown 源文本。
+  answerTarget.value = content.startsWith(answerTarget.value)
     ? content
-    : `${typedAnswer.value}${content}`
+    : `${answerTarget.value}${content}`
+  answerStreamCompleted.value = false
+  answerPlaybackCompleted.value = false
   isTyping.value = true
+  scheduleTypewriter(firstChunk ? FIRST_ANSWER_DELAY_MS : 0)
+}
+
+function scheduleTypewriter(delay = TYPEWRITER_INTERVAL_MS) {
+  if (typewriterTimer !== undefined) return
+  typewriterTimer = window.setTimeout(runTypewriterStep, delay)
+}
+
+function runTypewriterStep() {
+  typewriterTimer = undefined
+  const remaining = answerTarget.value.length - typedAnswer.value.length
+  if (remaining > 0) {
+    const step = remaining > 480 ? 3 : remaining > 120 ? 2 : 1
+    typedAnswer.value = answerTarget.value.slice(0, typedAnswer.value.length + step)
+    scheduleMarkdownRender()
+    typewriterScrollTick += 1
+    if (typewriterScrollTick % 3 === 0) void scrollMessagesToBottom()
+  }
+
+  if (typedAnswer.value.length < answerTarget.value.length) {
+    scheduleTypewriter()
+    return
+  }
+  completeAnswerPlayback()
+}
+
+function completeAnswerPlayback() {
+  if (!answerStreamCompleted.value || typedAnswer.value.length < answerTarget.value.length) return
+  isTyping.value = false
+  answerPlaybackCompleted.value = true
+  scheduleMarkdownRender(true)
+  void scrollMessagesToBottom()
+}
+
+function scheduleMarkdownRender(immediate = false) {
+  if (immediate) {
+    if (markdownRenderTimer !== undefined) window.clearTimeout(markdownRenderTimer)
+    markdownRenderTimer = undefined
+    renderedAnswer.value = renderMarkdown(typedAnswer.value)
+    return
+  }
+  if (markdownRenderTimer !== undefined) return
+  markdownRenderTimer = window.setTimeout(() => {
+    markdownRenderTimer = undefined
+    // 每次都重新解析当前完整 Markdown，禁止把不完整 HTML 片段直接拼进 DOM。
+    renderedAnswer.value = renderMarkdown(typedAnswer.value)
+  }, MARKDOWN_RENDER_INTERVAL_MS)
+}
+
+function stopAnswerTimers() {
+  if (typewriterTimer !== undefined) window.clearTimeout(typewriterTimer)
+  if (markdownRenderTimer !== undefined) window.clearTimeout(markdownRenderTimer)
+  typewriterTimer = undefined
+  markdownRenderTimer = undefined
 }
 
 function enqueueReasoningChunk(content: string, occurredAt: string) {
@@ -776,13 +1206,15 @@ function enqueueReasoningChunk(content: string, occurredAt: string) {
   reasoningText.value = `${reasoningText.value}${content}`
   isReasoning.value = true
   reasoningExpanded.value = true
+  void scrollReasoningToBottom()
 }
 
 function finishReasoning(occurredAt?: string) {
-  if (!isReasoning.value) return
-  isReasoning.value = false
-  reasoningEndedAt.value = occurredAt ? parseServerTime(occurredAt) : Date.now()
-  reasoningExpanded.value = false
+  if (isReasoning.value) {
+    isReasoning.value = false
+    reasoningEndedAt.value = occurredAt ? parseServerTime(occurredAt) : Date.now()
+  }
+  if (reasoningText.value) reasoningExpanded.value = false
 }
 
 function restoreReasoning(run: RunSummary, source: RunEvent[]) {
@@ -800,21 +1232,40 @@ function restoreReasoning(run: RunSummary, source: RunEvent[]) {
   }
   const closingEvent = source.find((event) => (
     event.sequence > last.sequence
-    && (event.type === 'message.delta' || event.type === 'run.completed' || event.type === 'run.failed')
+    && (event.type === 'message.delta' || event.type === 'run.completed' || event.type === 'run.failed' || event.type === 'run.cancelled')
   ))
   isReasoning.value = !closingEvent && ['running', 'pending'].includes(run.status)
   reasoningEndedAt.value = closingEvent ? parseServerTime(closingEvent.occurred_at) : null
   reasoningExpanded.value = isReasoning.value
 }
 
-function setAnswerTarget(answer: string, _animate: boolean) {
-  if (!answer) {
-    typedAnswer.value = ''
+function setAnswerTarget(answer: string, animate: boolean) {
+  if (!animate) {
+    stopAnswerTimers()
+    answerTarget.value = answer
+    typedAnswer.value = answer
     isTyping.value = false
+    answerPlaybackCompleted.value = true
+    renderedAnswer.value = renderMarkdown(answer)
     return
   }
-  typedAnswer.value = answer
-  isTyping.value = false
+  if (typedAnswer.value && !answer.startsWith(typedAnswer.value)) {
+    stopAnswerTimers()
+    typedAnswer.value = ''
+    renderedAnswer.value = ''
+  }
+  answerTarget.value = answer
+  answerPlaybackCompleted.value = false
+  if (!answer) {
+    completeAnswerPlayback()
+    return
+  }
+  isTyping.value = true
+  if (typedAnswer.value.length >= answerTarget.value.length) {
+    completeAnswerPlayback()
+    return
+  }
+  scheduleTypewriter(typedAnswer.value ? 0 : FIRST_ANSWER_DELAY_MS)
 }
 
 function renderMarkdown(value: string): string {
@@ -826,13 +1277,20 @@ function renderMarkdown(value: string): string {
 }
 
 function resetTypewriter() {
+  stopAnswerTimers()
+  answerTarget.value = ''
   typedAnswer.value = ''
+  renderedAnswer.value = ''
   isTyping.value = false
+  answerStreamCompleted.value = false
+  answerPlaybackCompleted.value = false
+  typewriterScrollTick = 0
   reasoningText.value = ''
   isReasoning.value = false
   reasoningExpanded.value = true
   reasoningStartedAt.value = null
   reasoningEndedAt.value = null
+  reasoningAutoFollow.value = true
 }
 
 function formatElapsed(milliseconds: number): string {
@@ -868,6 +1326,20 @@ function handleMessageScroll() {
   const element = messageScroll.value
   if (!element) return
   isNearMessageBottom.value = element.scrollHeight - element.scrollTop - element.clientHeight < 96
+}
+
+function handleReasoningScroll() {
+  const element = reasoningScroll.value
+  if (!element) return
+  reasoningAutoFollow.value = element.scrollHeight - element.scrollTop - element.clientHeight < 36
+}
+
+async function scrollReasoningToBottom(force = false) {
+  await nextTick()
+  const element = reasoningScroll.value
+  if (!element || (!force && !reasoningAutoFollow.value)) return
+  element.scrollTop = element.scrollHeight
+  reasoningAutoFollow.value = true
 }
 
 async function scrollMessagesToBottom(force = false) {
@@ -967,7 +1439,7 @@ function runReasoningElapsed(run: RunSummary): string {
   if (!first || !last) return ''
   const end = source.find((event) => (
     event.sequence > last.sequence
-    && (event.type === 'message.delta' || event.type === 'run.completed' || event.type === 'run.failed')
+    && (event.type === 'message.delta' || event.type === 'run.completed' || event.type === 'run.failed' || event.type === 'run.cancelled')
   ))
   const duration = parseServerTime(end?.occurred_at || last.occurred_at)
     - parseServerTime(first.occurred_at)
@@ -980,7 +1452,102 @@ function runAnswer(run: RunSummary): string {
   const assistantMessage = messages.value.find((message) => (
     message.role === 'assistant' && String(message.extra?.run_id || '') === run.id
   ))
-  return assistantMessage?.content || ''
+  return assistantMessage?.content || answerFromEvents(run.events || [])
+}
+
+function answerFromEvents(source: RunEvent[]): string {
+  let answer = ''
+  for (const event of source) {
+    if (event.type !== 'message.delta' || String(event.payload.stage || '') !== 'final') continue
+    const content = String(event.payload.content || '')
+    answer = content.startsWith(answer) ? content : `${answer}${content}`
+  }
+  return answer
+}
+
+function mergeRunArtifacts(...groups: RunArtifact[][]): RunArtifact[] {
+  const byIdentity = new Map<string, RunArtifact>()
+  for (const artifact of groups.flat()) {
+    const filename = artifact.content?.file?.filename?.trim().toLocaleLowerCase()
+    const identity = filename ? `file:${filename}` : `id:${artifact.id}`
+    byIdentity.set(identity, artifact)
+  }
+  return [...byIdentity.values()]
+}
+
+function runArtifacts(run: RunSummary): RunArtifact[] {
+  return mergeRunArtifacts(run.artifacts || []).filter((artifact) => (
+    artifact.kind === 'generated-file' && Boolean(artifact.content?.file?.filename)
+  ))
+}
+
+function runCitations(run: RunSummary): SourceCitation[] {
+  return citationsFromEvents(run.events || [])
+}
+
+function citationsFromEvents(source: RunEvent[]): SourceCitation[] {
+  const citations = new Map<string, SourceCitation>()
+  for (const event of source) {
+    if (event.type !== 'citation.created') continue
+    const citation = event.payload.citation as Partial<SourceCitation> | undefined
+    const url = String(citation?.url || '').trim()
+    if (!url.startsWith('http://') && !url.startsWith('https://')) continue
+    const id = String(citation?.id || url)
+    if (citations.has(id)) continue
+    citations.set(id, {
+      id,
+      citation_number: Number(citation?.citation_number || citations.size + 1),
+      title: String(citation?.title || citation?.domain || url),
+      url,
+      domain: String(citation?.domain || citationDomain(url)),
+      snippet: String(citation?.snippet || ''),
+      provider: String(citation?.provider || 'web'),
+    })
+  }
+  return [...citations.values()]
+}
+
+function citationDomain(url: string): string {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return url
+  }
+}
+
+async function copyRunAnswer(run: RunSummary) {
+  const content = run.id === activeRun.value?.id
+    ? typedAnswer.value || runAnswer(run)
+    : runAnswer(run)
+  if (!content) return
+  try {
+    await navigator.clipboard.writeText(content)
+    copiedAnswerRunId.value = run.id
+    window.setTimeout(() => {
+      if (copiedAnswerRunId.value === run.id) copiedAnswerRunId.value = ''
+    }, 1500)
+  } catch {
+    window.alert('复制失败，请手动选择回答内容。')
+  }
+}
+
+function sameUrl(left: string, right: string): boolean {
+  if (!left || !right) return false
+  try {
+    return new URL(left).href === new URL(right).href
+  } catch {
+    return left === right
+  }
+}
+
+function sourceInitial(citation: SourceCitation): string {
+  return (citation.domain || citation.title || 'W').replace(/^www\./, '').slice(0, 1).toUpperCase()
+}
+
+function artifactFileType(artifact: RunArtifact): string {
+  const filename = artifact.content?.file?.filename || ''
+  const dot = filename.lastIndexOf('.')
+  return attachmentTypeByExtension(dot >= 0 ? filename.slice(dot) : '')
 }
 
 function runStatusLabel(status: string): string {
@@ -990,6 +1557,7 @@ function runStatusLabel(status: string): string {
     waiting_approval: '等待审批',
     completed: '已完成',
     failed: '执行失败',
+    cancelled: '已停止',
   }
   return labels[status] || status
 }
@@ -1108,6 +1676,10 @@ function buildProcessSteps(source: RunEvent[], runStatus: string): ProcessStep[]
       activate({ id: 'failed', title: '执行遇到问题', detail: eventMessage(event), occurredAt, status: 'failed' })
       continue
     }
+    if (event.type === 'run.cancelled') {
+      activate({ id: 'cancelled', title: '已停止生成', detail: eventMessage(event), occurredAt, status: 'done' })
+      continue
+    }
     if (event.type === 'run.completed') {
       activate({ id: 'complete', title: '完成并生成答复', detail: '结果已保存，可以继续追问', occurredAt, status: 'done' })
       continue
@@ -1164,6 +1736,8 @@ function toolStepTitle(tool: string): string {
     read_file: '读取工作区文件',
     web_fetch: '获取网页内容',
     database_query: '查询业务数据',
+    create_excel_artifact: '生成 Excel 文件',
+    create_word_artifact: '生成 Word 文档',
   }
   return labels[tool] || `使用工具：${tool || '未知工具'}`
 }
@@ -1194,6 +1768,7 @@ function eventStage(event: RunEvent): string {
     'run.started': '任务开始',
     'run.completed': '任务完成',
     'run.failed': '任务失败',
+    'run.cancelled': '已停止生成',
     'tool.started': '调用工具',
     'tool.completed': '工具调用完成',
     'approval.required': '等待高风险操作审批',
@@ -1334,9 +1909,9 @@ function formatTime(value: string): string {
         </section>
 
         <section v-for="turn in historicalTurns" :key="turn.id" class="conversation-turn historical-turn">
-          <article class="message user">
+          <article class="message user" :class="{ 'has-question-actions': isTerminalRun(turn.latestRun) }">
             <div class="avatar">我</div>
-            <div class="bubble user-bubble">
+            <div class="bubble user-bubble" :tabindex="isTerminalRun(turn.latestRun) ? 0 : undefined">
               <div v-if="turnAttachments(turn).length" class="sent-attachment-grid">
                 <article
                   v-for="(attachment, index) in turnAttachments(turn)"
@@ -1347,7 +1922,54 @@ function formatTime(value: string): string {
                   <div><strong>{{ attachment.filename }}</strong><small>{{ attachmentTypeByExtension(attachment.extension) }} · {{ formatFileSize(attachment.file_size) }}</small></div>
                 </article>
               </div>
-              <p>{{ turn.attempts[0]?.question || turn.latestRun.question }}</p>
+              <div v-if="editingRunId === turn.latestRun.id" class="user-question-editor">
+                <textarea
+                  v-model="editingQuestion"
+                  rows="3"
+                  aria-label="编辑问题"
+                  @keydown="handleEditKeydown($event, turn.latestRun)"
+                ></textarea>
+                <span v-if="editError" class="question-edit-error">{{ editError }}</span>
+                <div class="question-edit-actions">
+                  <button type="button" @click="cancelEditing">取消</button>
+                  <button type="button" :disabled="isRetrying || !editingQuestion.trim()" @click="submitEditedRun(turn.latestRun)">
+                    {{ isRetrying ? '发送中…' : '发送' }}
+                  </button>
+                </div>
+              </div>
+              <template v-else>
+                <p>{{ turn.attempts[0]?.question || turn.latestRun.question }}</p>
+                <div v-if="isTerminalRun(turn.latestRun)" class="question-actions" aria-label="问题操作">
+                  <button
+                    class="question-action-button"
+                    :class="{ 'is-copied': copiedRunId === turn.latestRun.id }"
+                    type="button"
+                    :aria-label="copiedRunId === turn.latestRun.id ? '已复制' : '复制问题'"
+                    :title="copiedRunId === turn.latestRun.id ? '已复制' : '复制'"
+                    @click="copyRunQuestion(turn.latestRun)"
+                  >
+                    <svg v-if="copiedRunId === turn.latestRun.id" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m5 12.5 4.2 4.2L19 7"></path>
+                    </svg>
+                    <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="8" y="8" width="11" height="11" rx="2"></rect>
+                      <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path>
+                    </svg>
+                  </button>
+                  <button
+                    class="question-action-button"
+                    type="button"
+                    aria-label="编辑问题"
+                    title="编辑"
+                    @click="startEditing(turn.latestRun)"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M13.5 6.5 17.5 10.5"></path>
+                      <path d="M4 20h4l10.5-10.5a2.8 2.8 0 0 0-4-4L4 16v4Z"></path>
+                    </svg>
+                  </button>
+                </div>
+              </template>
             </div>
           </article>
           <article class="message assistant run-message">
@@ -1375,18 +1997,81 @@ function formatTime(value: string): string {
                 class="historical-answer markdown-body"
                 :class="{ 'without-reasoning': !runReasoning(turn.latestRun) }"
                 v-html="renderMarkdown(runAnswer(turn.latestRun))"
+                @click="handleCitationClick($event, turn.latestRun)"
               ></div>
               <div v-else-if="turn.latestRun.error" class="run-error compact-error">
                 <p>{{ turn.latestRun.error }}</p>
               </div>
+              <div v-else-if="turn.latestRun.status === 'cancelled'" class="run-cancelled compact-cancelled">
+                <span>回答已停止</span>
+                <button type="button" :disabled="isRetrying || isResponseActive" @click="rerunRun(turn.latestRun)">重新开始</button>
+              </div>
+              <button
+                v-if="runCitations(turn.latestRun).length"
+                class="citation-summary-chip"
+                type="button"
+                @click="openRunCitations(turn.latestRun)"
+              >
+                <span class="citation-summary-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1.1l2-2A5 5 0 0 0 12 4l-1.1 1.1M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1"></path></svg>
+                </span>
+                <span class="citation-site-stack" aria-hidden="true">
+                  <i v-for="citation in runCitations(turn.latestRun).slice(0, 3)" :key="citation.id">{{ sourceInitial(citation) }}</i>
+                </span>
+                <strong>{{ runCitations(turn.latestRun).length }} 个网页</strong>
+              </button>
+              <div v-if="runAnswer(turn.latestRun)" class="answer-actions" aria-label="回答操作">
+                <button
+                  type="button"
+                  :class="{ 'is-copied': copiedAnswerRunId === turn.latestRun.id }"
+                  :aria-label="copiedAnswerRunId === turn.latestRun.id ? '已复制回答' : '复制回答'"
+                  :title="copiedAnswerRunId === turn.latestRun.id ? '已复制' : '复制回答'"
+                  @click="copyRunAnswer(turn.latestRun)"
+                >
+                  <svg v-if="copiedAnswerRunId === turn.latestRun.id" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>
+                  <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+                </button>
+                <button
+                  type="button"
+                  aria-label="重新生成回答"
+                  title="重新生成"
+                  :disabled="isRetrying || isResponseActive"
+                  @click="rerunRun(turn.latestRun)"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"></path><path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path></svg>
+                </button>
+              </div>
+              <section v-if="runArtifacts(turn.latestRun).length" class="artifact-deliveries compact-artifacts">
+                <header><strong>生成文件</strong><span>{{ runArtifacts(turn.latestRun).length }} 个</span></header>
+                <div class="artifact-delivery-list">
+                  <article
+                    v-for="artifact in runArtifacts(turn.latestRun)"
+                    :key="artifact.id"
+                    class="artifact-delivery-card"
+                    :class="{ selected: selectedArtifact?.id === artifact.id }"
+                    role="button"
+                    tabindex="0"
+                    @click="openArtifactPreview(artifact)"
+                    @keydown.enter="openArtifactPreview(artifact)"
+                  >
+                    <span class="artifact-file-icon" :data-kind="artifactFileType(artifact)">{{ artifactFileType(artifact).slice(0, 1) }}</span>
+                    <div class="artifact-file-copy">
+                      <strong>{{ artifact.title || artifact.content?.file?.filename }}</strong>
+                      <small>{{ artifact.content?.file?.filename }} · {{ formatFileSize(artifact.content?.file?.size || 0) }}</small>
+                    </div>
+                    <a v-if="artifact.content?.file?.download_url" class="artifact-download" :href="artifact.content.file.download_url" download @click.stop>下载</a>
+                    <span v-else class="artifact-pending">准备中</span>
+                  </article>
+                </div>
+              </section>
             </section>
           </article>
         </section>
 
         <section v-if="activeRun" class="conversation-turn active-turn">
-          <article class="message user">
+          <article class="message user" :class="{ 'has-question-actions': isTerminalRun(activeRun) }">
             <div class="avatar">我</div>
-            <div class="bubble user-bubble">
+            <div class="bubble user-bubble" :tabindex="isTerminalRun(activeRun) ? 0 : undefined">
               <div v-if="activeRun.attachments?.length" class="sent-attachment-grid">
                 <article
                   v-for="(attachment, index) in activeRun.attachments"
@@ -1397,7 +2082,54 @@ function formatTime(value: string): string {
                   <div><strong>{{ attachment.filename }}</strong><small>{{ attachmentTypeByExtension(attachment.extension) }} · {{ formatFileSize(attachment.file_size) }}</small></div>
                 </article>
               </div>
-              <p>{{ activeRun.question }}</p>
+              <div v-if="editingRunId === activeRun.id" class="user-question-editor">
+                <textarea
+                  v-model="editingQuestion"
+                  rows="3"
+                  aria-label="编辑问题"
+                  @keydown="handleEditKeydown($event, activeRun)"
+                ></textarea>
+                <span v-if="editError" class="question-edit-error">{{ editError }}</span>
+                <div class="question-edit-actions">
+                  <button type="button" @click="cancelEditing">取消</button>
+                  <button type="button" :disabled="isRetrying || !editingQuestion.trim()" @click="submitEditedRun(activeRun)">
+                    {{ isRetrying ? '发送中…' : '发送' }}
+                  </button>
+                </div>
+              </div>
+              <template v-else>
+                <p>{{ activeRun.question }}</p>
+                <div v-if="isTerminalRun(activeRun)" class="question-actions" aria-label="问题操作">
+                  <button
+                    class="question-action-button"
+                    :class="{ 'is-copied': copiedRunId === activeRun.id }"
+                    type="button"
+                    :aria-label="copiedRunId === activeRun.id ? '已复制' : '复制问题'"
+                    :title="copiedRunId === activeRun.id ? '已复制' : '复制'"
+                    @click="copyRunQuestion(activeRun)"
+                  >
+                    <svg v-if="copiedRunId === activeRun.id" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m5 12.5 4.2 4.2L19 7"></path>
+                    </svg>
+                    <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="8" y="8" width="11" height="11" rx="2"></rect>
+                      <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path>
+                    </svg>
+                  </button>
+                  <button
+                    class="question-action-button"
+                    type="button"
+                    aria-label="编辑问题"
+                    title="编辑"
+                    @click="startEditing(activeRun)"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M13.5 6.5 17.5 10.5"></path>
+                      <path d="M4 20h4l10.5-10.5a2.8 2.8 0 0 0-4-4L4 16v4Z"></path>
+                    </svg>
+                  </button>
+                </div>
+              </template>
             </div>
           </article>
           <article class="message assistant run-message">
@@ -1449,18 +2181,43 @@ function formatTime(value: string): string {
                 </div>
               </section>
 
+              <section
+                v-if="isPreparingResponse"
+                class="reasoning-panel is-active response-preparing"
+                role="status"
+                aria-live="polite"
+              >
+                <div class="response-preparing-header">
+                  <span class="reasoning-orb" aria-hidden="true">✦</span>
+                  <div class="response-preparing-copy">
+                    <strong>{{ preparingResponseTitle }}</strong>
+                    <small>{{ preparingResponseDetail }}</small>
+                  </div>
+                  <span class="response-preparing-dots" aria-hidden="true">
+                    <i></i><i></i><i></i>
+                  </span>
+                </div>
+              </section>
+
               <section v-if="reasoningText || isReasoning" class="reasoning-panel" :class="{ 'is-active': isReasoning }">
                 <button class="reasoning-toggle" type="button" @click="reasoningExpanded = !reasoningExpanded">
                   <span class="reasoning-orb" aria-hidden="true">✦</span>
-                  <strong>{{ isReasoning ? '正在深度思考' : '已深度思考' }} {{ reasoningElapsedText }}</strong>
+                  <strong class="reasoning-status">
+                    <span>{{ isReasoning ? '正在深度思考' : '已深度思考' }}</span>
+                    <time>{{ reasoningElapsedText }}</time>
+                  </strong>
                   <span class="reasoning-chevron" :class="{ expanded: reasoningExpanded }">⌄</span>
                 </button>
-                <div
-                  v-show="reasoningExpanded"
-                  class="reasoning-content markdown-body"
-                  :class="{ 'is-reasoning': isReasoning }"
-                  v-html="renderedReasoning"
-                ></div>
+                <Transition name="reasoning-collapse">
+                  <div
+                    v-if="reasoningExpanded"
+                    ref="reasoningScroll"
+                    class="reasoning-content markdown-body"
+                    :class="{ 'is-reasoning': isReasoning }"
+                    @scroll="handleReasoningScroll"
+                    v-html="renderedReasoning"
+                  ></div>
+                </Transition>
               </section>
 
               <div
@@ -1469,12 +2226,88 @@ function formatTime(value: string): string {
                 :class="{ 'without-reasoning': !reasoningText && !isReasoning }"
                 aria-live="polite"
               >
-                <header><strong>最终答复</strong><span>{{ isTyping ? '正在接收回复' : '生成完成' }}</span></header>
+                <header><strong>最终答复</strong><span :class="{ streaming: isTyping }">{{ isTyping ? '正在生成' : '生成完成' }}</span></header>
                 <div
                   class="markdown-body"
                   :class="{ 'is-typing': isTyping }"
                   v-html="renderedAnswer"
+                  @click="handleCitationClick($event)"
                 ></div>
+              </div>
+
+              <button
+                v-if="answerPlaybackCompleted && activeCitations.length"
+                class="citation-summary-chip"
+                type="button"
+                @click="openCitationSources(activeCitations)"
+              >
+                <span class="citation-summary-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1.1l2-2A5 5 0 0 0 12 4l-1.1 1.1M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1"></path></svg>
+                </span>
+                <span class="citation-site-stack" aria-hidden="true">
+                  <i v-for="citation in activeCitations.slice(0, 3)" :key="citation.id">{{ sourceInitial(citation) }}</i>
+                </span>
+                <strong>{{ activeCitations.length }} 个网页</strong>
+              </button>
+
+              <div
+                v-if="answerPlaybackCompleted && typedAnswer && !isRunActive"
+                class="answer-actions"
+                aria-label="回答操作"
+              >
+                <button
+                  type="button"
+                  :class="{ 'is-copied': copiedAnswerRunId === activeRun.id }"
+                  :aria-label="copiedAnswerRunId === activeRun.id ? '已复制回答' : '复制回答'"
+                  :title="copiedAnswerRunId === activeRun.id ? '已复制' : '复制回答'"
+                  @click="copyRunAnswer(activeRun)"
+                >
+                  <svg v-if="copiedAnswerRunId === activeRun.id" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>
+                  <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+                </button>
+                <button
+                  type="button"
+                  aria-label="重新生成回答"
+                  title="重新生成"
+                  :disabled="isRetrying || isResponseActive"
+                  @click="rerunRun(activeRun)"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"></path><path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path></svg>
+                </button>
+              </div>
+
+              <section v-if="showActiveArtifacts && runArtifacts(activeRun).length" class="artifact-deliveries">
+                <header><strong>已生成文件</strong><span>可下载并继续使用</span></header>
+                <div class="artifact-delivery-list">
+                  <article
+                    v-for="artifact in runArtifacts(activeRun)"
+                    :key="artifact.id"
+                    class="artifact-delivery-card"
+                    :class="{ selected: selectedArtifact?.id === artifact.id }"
+                    role="button"
+                    tabindex="0"
+                    @click="openArtifactPreview(artifact)"
+                    @keydown.enter="openArtifactPreview(artifact)"
+                  >
+                    <span class="artifact-file-icon" :data-kind="artifactFileType(artifact)">{{ artifactFileType(artifact).slice(0, 1) }}</span>
+                    <div class="artifact-file-copy">
+                      <strong>{{ artifact.title || artifact.content?.file?.filename }}</strong>
+                      <small>{{ artifact.content?.file?.filename }} · {{ formatFileSize(artifact.content?.file?.size || 0) }}</small>
+                    </div>
+                    <a v-if="artifact.content?.file?.download_url" class="artifact-download" :href="artifact.content.file.download_url" download @click.stop>下载文件</a>
+                    <span v-else class="artifact-pending">准备中</span>
+                  </article>
+                </div>
+              </section>
+
+              <div v-if="activeRun.status === 'cancelled'" class="run-cancelled">
+                <div>
+                  <strong>已停止生成</strong>
+                  <span>已保留当前回答、执行轨迹和已生成文件。</span>
+                </div>
+                <button type="button" :disabled="isRetrying" @click="rerunRun(activeRun)">
+                  {{ isRetrying ? '正在重新开始…' : '重新开始' }}
+                </button>
               </div>
 
               <div v-if="failureDetail" class="run-error">
@@ -1553,7 +2386,7 @@ function formatTime(value: string): string {
           <textarea
             v-model="question"
             rows="3"
-            placeholder="发消息，或粘贴、拖入 PDF、Word、PPT、Excel 等文件…"
+            placeholder="输入您的问题，或粘贴、拖入文件进行分析…"
             @keydown="handleComposerKeydown"
           />
           <div class="composer-tools">
@@ -1582,7 +2415,18 @@ function formatTime(value: string): string {
                 </select>
               </label>
             </div>
-            <button class="send" type="button" :disabled="!canSubmit" @click="submitRun">
+            <button
+              v-if="isResponseActive"
+              class="send stop-send"
+              type="button"
+              :disabled="isStopping"
+              aria-label="停止生成"
+              title="停止生成"
+              @click="cancelActiveRun"
+            >
+              <span class="stop-glyph" aria-hidden="true"></span>
+            </button>
+            <button v-else class="send" type="button" :disabled="!canSubmit" @click="submitRun">
               {{ isSubmitting ? '...' : '↑' }}
             </button>
           </div>
@@ -1591,11 +2435,23 @@ function formatTime(value: string): string {
       </footer>
     </section>
 
-    <aside v-if="!executionCollapsed" class="execution-sidebar" aria-label="执行轨迹">
+    <aside
+      v-if="!executionCollapsed"
+      class="execution-sidebar"
+      :class="{
+        'is-preview-mode': sidebarMode !== 'trace',
+        'is-sources-mode': sidebarMode === 'sources',
+      }"
+      :aria-label="sidebarTitle"
+    >
       <header class="execution-sidebar-header">
-        <div><span>AGENT TRACE</span><strong>执行轨迹</strong></div>
+        <div>
+          <span>{{ sidebarEyebrow }}</span>
+          <strong>{{ sidebarTitle }}</strong>
+        </div>
         <div class="execution-header-actions">
-          <small>{{ processProgressText }}</small>
+          <button v-if="sidebarMode !== 'trace'" class="preview-trace-button" type="button" @click="showExecutionTrace">返回轨迹</button>
+          <small v-else>{{ processProgressText }}</small>
           <button
             class="sidebar-collapse-button"
             type="button"
@@ -1607,7 +2463,110 @@ function formatTime(value: string): string {
         </div>
       </header>
 
-      <template v-if="activeRun">
+      <template v-if="sidebarMode === 'sources' && selectedCitation">
+        <section class="citation-browser-pane">
+          <header class="citation-browser-summary">
+            <span class="citation-browser-number">{{ selectedCitation.citation_number }}</span>
+            <div>
+              <strong>{{ selectedCitation.title }}</strong>
+              <small>{{ selectedCitation.domain }}</small>
+            </div>
+            <a :href="selectedCitation.url" target="_blank" rel="noopener noreferrer">打开原网页</a>
+          </header>
+
+          <p v-if="selectedCitation.snippet" class="citation-browser-snippet">{{ selectedCitation.snippet }}</p>
+
+          <div class="citation-browser-list" aria-label="引用来源列表">
+            <button
+              v-for="citation in sourcePanelCitations"
+              :key="citation.id"
+              type="button"
+              :class="{ selected: citation.id === selectedCitation.id }"
+              @click="selectCitation(citation)"
+            >
+              <span>{{ citation.citation_number }}</span>
+              <span><strong>{{ citation.title }}</strong><small>{{ citation.domain }}</small></span>
+            </button>
+          </div>
+
+          <div class="citation-webpage-frame">
+            <div>
+              <span>安全网页预览</span>
+              <small>若网站禁止嵌入，请点击“打开原网页”</small>
+            </div>
+            <iframe
+              :key="selectedCitation.url"
+              :src="selectedCitation.url"
+              :title="`引用网页：${selectedCitation.title}`"
+              sandbox="allow-scripts allow-forms allow-popups allow-downloads"
+              referrerpolicy="no-referrer"
+              loading="lazy"
+            ></iframe>
+          </div>
+        </section>
+      </template>
+
+      <template v-else-if="sidebarMode === 'preview' && selectedArtifact">
+        <section class="file-preview-pane">
+          <header class="file-preview-summary">
+            <span class="artifact-file-icon" :data-kind="artifactFileType(selectedArtifact)">{{ artifactFileType(selectedArtifact).slice(0, 1) }}</span>
+            <div>
+              <strong>{{ selectedArtifact.title || selectedArtifactFile?.filename }}</strong>
+              <small>{{ selectedArtifactFile?.filename }} · {{ formatFileSize(selectedArtifactFile?.size || 0) }}</small>
+            </div>
+            <a v-if="selectedArtifactFile?.download_url" :href="selectedArtifactFile.download_url" download>下载</a>
+            <span v-else class="artifact-pending">准备中</span>
+          </header>
+
+          <section v-if="selectedArtifactPreview?.kind === 'table'" class="file-preview-content">
+            <div class="file-preview-meta">
+              <span>{{ selectedArtifactPreview.sheet_name || '数据' }}</span>
+              <small v-if="selectedArtifactPreview.row_count">共 {{ selectedArtifactPreview.row_count }} 行</small>
+            </div>
+            <div class="file-preview-table-wrap">
+              <table class="file-preview-table">
+                <thead v-if="selectedArtifactPreview.headers?.length">
+                  <tr><th v-for="header in selectedArtifactPreview.headers" :key="header">{{ header }}</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row, rowIndex) in selectedArtifactPreview.rows || []" :key="rowIndex">
+                    <td v-for="(cell, cellIndex) in row" :key="cellIndex">{{ cell }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p>当前展示生成时保存的前 {{ selectedArtifactPreview.rows?.length || 0 }} 行安全预览。</p>
+          </section>
+
+          <section v-else-if="selectedArtifactPreview?.kind === 'document'" class="file-preview-content document-preview">
+            <h2>{{ selectedArtifactPreview.title || selectedArtifact.title }}</h2>
+            <article v-for="(section, sectionIndex) in selectedArtifactPreview.sections || []" :key="sectionIndex">
+              <h3 v-if="section.heading">{{ section.heading }}</h3>
+              <p v-for="(paragraph, paragraphIndex) in section.paragraphs || []" :key="`p-${paragraphIndex}`">{{ paragraph }}</p>
+              <ul v-if="section.bullets?.length">
+                <li v-for="(bullet, bulletIndex) in section.bullets" :key="bulletIndex">{{ bullet }}</li>
+              </ul>
+              <div v-if="section.table" class="file-preview-table-wrap">
+                <table class="file-preview-table">
+                  <thead><tr><th v-for="header in section.table.headers || []" :key="header">{{ header }}</th></tr></thead>
+                  <tbody>
+                    <tr v-for="(row, rowIndex) in section.table.rows || []" :key="rowIndex">
+                      <td v-for="(cell, cellIndex) in row" :key="cellIndex">{{ cell }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </article>
+          </section>
+
+          <section v-else-if="selectedArtifactPreview?.text" class="file-preview-content document-preview legacy-preview">
+            <p>{{ selectedArtifactPreview.text }}</p>
+          </section>
+          <div v-else class="execution-sidebar-empty"><span>◇</span><p>该文件没有可展示的预览数据，请下载后查看。</p></div>
+        </section>
+      </template>
+
+      <template v-else-if="activeRun">
         <section class="process-ledger">
           <div v-if="processSteps.length" class="process-list">
             <article
