@@ -40,6 +40,41 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .shell.sessions-collapsed { --sessions-width: 0px; }
 .shell.execution-collapsed { --execution-width: 0px; }
+.shell.execution-resizing {
+  cursor: col-resize;
+  user-select: none;
+  transition: none;
+}
+.shell.execution-resizing * { cursor: col-resize !important; }
+
+.execution-resizer {
+  z-index: 8;
+  grid-column: 3;
+  grid-row: 1;
+  align-self: stretch;
+  justify-self: start;
+  width: 10px;
+  height: 100vh;
+  transform: translateX(-50%);
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+.execution-resizer::after {
+  display: block;
+  width: 2px;
+  height: 100%;
+  margin: 0 auto;
+  content: '';
+  background: transparent;
+  transition: background .16s ease, box-shadow .16s ease;
+}
+.execution-resizer:hover::after,
+.execution-resizer:focus-visible::after,
+.shell.execution-resizing .execution-resizer::after {
+  background: #8ea3f7;
+  box-shadow: 0 0 0 2px rgba(74,108,247,.12);
+}
 
 .sessions {
   grid-column: 1;
@@ -438,8 +473,12 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   color: white;
   background: linear-gradient(135deg, var(--blue), var(--mint));
 }
-.agent-panel {
+.agent-response-column {
   width: min(820px, calc(100% - 46px));
+  min-width: 0;
+}
+.agent-panel {
+  width: 100%;
   min-width: 0;
   padding: 16px 18px 18px;
   border: 1px solid #dfe5f5;
@@ -739,7 +778,9 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   align-items: center;
   justify-content: flex-end;
   gap: 3px;
-  margin-top: 10px;
+  min-height: 34px;
+  margin-top: 6px;
+  padding: 0 4px;
 }
 .answer-actions button {
   display: grid;
@@ -1155,6 +1196,12 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 .composer-wrap {
   padding: 0 clamp(18px, 7vw, 86px) 24px;
 }
+.response-mode-bar {
+  display: flex;
+  justify-content: center;
+  max-width: 860px;
+  margin: 0 auto 10px;
+}
 .composer {
   max-width: 860px;
   margin: 0 auto;
@@ -1297,6 +1344,55 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   cursor: pointer;
 }
 .agent-picker:focus-within { border-color: #aebcf4; box-shadow: 0 0 0 3px rgba(74,108,247,.08); }
+.response-mode-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(243,245,249,.96);
+  box-shadow: 0 8px 24px rgba(31,42,68,.08);
+}
+.response-mode-slider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 50%;
+  border-radius: 999px;
+  background: var(--blue);
+  box-shadow: 0 2px 7px rgba(49,81,212,.22);
+  pointer-events: none;
+  transform: translate3d(0,0,0);
+  will-change: transform;
+  transition: transform .24s cubic-bezier(.2,.8,.2,1);
+}
+.response-mode-picker.is-expert .response-mode-slider { transform: translate3d(100%,0,0); }
+.response-mode-picker button {
+  position: relative;
+  z-index: 1;
+  min-width: 104px;
+  height: 42px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  color: #667085;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color .2s ease;
+}
+.response-mode-picker button span { margin-right: 4px; font-size: 11px; }
+.response-mode-picker button:hover:not(:disabled):not(.active) { color: var(--blue-deep); }
+.response-mode-picker button.active {
+  color: #fff;
+  background: transparent;
+}
+.response-mode-picker button:focus-visible { outline: 2px solid #91a5f5; outline-offset: 2px; }
+.response-mode-picker button:disabled { cursor: default; opacity: .62; }
 .excel-file-input { display: none; }
 .send {
   width: 38px;
@@ -1331,19 +1427,24 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 
 @media (max-width: 760px) {
   .shell { display: block; height: auto; overflow: visible; }
+  .execution-resizer { display: none; }
   .sessions { display: none; }
   .chat { min-height: 100vh; height: auto; overflow: visible; }
   .chat-topbar { height: 56px; padding: 0 16px; }
   .message-scroll { overflow: visible; padding: 18px 16px 20px; }
   .empty-chat { margin-top: 9vh; text-align: left; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .agent-panel { width: calc(100% - 46px); padding: 14px; }
+  .agent-response-column { width: calc(100% - 46px); }
+  .agent-panel { padding: 14px; }
   .approval-card > header { display: grid; }
   .sandbox-badge { width: fit-content; }
   .approval-actions { flex-wrap: wrap; }
   .approval-actions > span { flex-basis: 100%; }
   .step-strip > div { grid-template-columns: 8px minmax(82px, auto) minmax(0, 1fr); }
   .composer-wrap { padding: 0 12px 14px; }
+  .response-mode-bar { margin-bottom: 8px; }
+  .response-mode-picker { width: min(240px, calc(100vw - 48px)); }
+  .response-mode-picker button { min-width: 0; flex: 1; padding: 0 8px; }
   .composer { border-radius: 18px; }
 }
 
@@ -1356,6 +1457,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+  .response-mode-slider { transition: transform .12s linear !important; }
 }
 
 @media (hover: none) {
@@ -1564,6 +1666,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 
 .execution-sidebar {
   grid-column: 3;
+  grid-row: 1;
   min-width: 0;
   height: 100vh;
   padding: 18px 16px;

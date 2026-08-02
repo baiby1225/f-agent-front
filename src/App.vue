@@ -41,11 +41,14 @@ type AttachmentSummary = {
   file_size: number
 }
 
+type ResponseMode = 'fast' | 'expert'
+
 type RunSummary = {
   id: string
   status: string
   question: string
   agent_key?: string
+  response_mode?: ResponseMode
   created_at?: string
   updated_at?: string
   result?: RunResult | null
@@ -66,6 +69,7 @@ type RunCreateResult = {
   conversation_id: string
   conversation_title: string
   status: string
+  response_mode: ResponseMode
 }
 
 type RunArtifact = {
@@ -107,6 +111,8 @@ type RunArtifact = {
 type RunResult = {
   answer?: string
   reasoning?: string
+  response_mode?: ResponseMode
+  execution_mode?: string
   analysis_result?: AttendanceSummary
 }
 
@@ -171,6 +177,12 @@ const events = ref<RunEvent[]>([])
 const toolRequests = ref<ToolRequest[]>([])
 const selectedConversationId = ref('')
 const selectedAgent = ref('')
+const RESPONSE_MODE_KEY = 'fuecn-response-mode'
+const responseMode = ref<ResponseMode>(
+  typeof window !== 'undefined' && window.localStorage.getItem(RESPONSE_MODE_KEY) === 'expert'
+    ? 'expert'
+    : 'fast',
+)
 const question = ref('')
 const tableText = ref('')
 const tableHtml = ref('')
@@ -203,6 +215,8 @@ const isTyping = ref(false)
 const answerStreamCompleted = ref(false)
 const answerPlaybackCompleted = ref(false)
 const reasoningText = ref('')
+const reasoningTarget = ref('')
+const renderedReasoning = ref('')
 const isReasoning = ref(false)
 const reasoningExpanded = ref(true)
 const reasoningStartedAt = ref<number | null>(null)
@@ -211,21 +225,33 @@ const clockNow = ref(Date.now())
 const isNearMessageBottom = ref(true)
 const SESSIONS_COLLAPSED_KEY = 'fuecn-sessions-collapsed'
 const EXECUTION_COLLAPSED_KEY = 'fuecn-execution-collapsed'
+const EXECUTION_WIDTH_KEY = 'fuecn-execution-width'
+const MIN_EXECUTION_WIDTH = 300
+const MAX_EXECUTION_WIDTH = 720
+const MIN_CHAT_WIDTH = 420
 const compactSidebarDefault = typeof window !== 'undefined'
   && window.matchMedia('(max-width: 1020px)').matches
 const sessionsCollapsed = ref(readCollapsedPreference(SESSIONS_COLLAPSED_KEY, compactSidebarDefault))
 const executionCollapsed = ref(readCollapsedPreference(EXECUTION_COLLAPSED_KEY, compactSidebarDefault))
+const executionWidth = ref(readExecutionWidth())
+const isExecutionResizing = ref(false)
 const sidebarMode = ref<'trace' | 'preview' | 'sources'>('trace')
 const selectedArtifact = ref<RunArtifact | null>(null)
 const sourcePanelCitations = ref<SourceCitation[]>([])
 const selectedCitation = ref<SourceCitation | null>(null)
 const TYPEWRITER_INTERVAL_MS = 20
+const REASONING_TYPEWRITER_INTERVAL_MS = 18
 const FIRST_ANSWER_DELAY_MS = 150
 const MARKDOWN_RENDER_INTERVAL_MS = 42
 let clockTimer: number | undefined
 let typewriterTimer: number | undefined
+let reasoningTypewriterTimer: number | undefined
+let executionResizeStartX = 0
+let executionResizeStartWidth = 0
 let markdownRenderTimer: number | undefined
+let reasoningMarkdownRenderTimer: number | undefined
 let typewriterScrollTick = 0
+let reasoningScrollTick = 0
 let eventQueue: Promise<void> = Promise.resolve()
 
 const conversationGroups = computed<ConversationGroup[]>(() => {
@@ -335,12 +361,13 @@ const isPreparingResponse = computed(() => (
   && !isTyping.value
 ))
 const preparingResponseTitle = computed(() => (
-  activeProcessStep.value?.title || '正在准备处理你的请求'
+  activeProcessStep.value?.title
+  || (runResponseMode(activeRun.value) === 'expert' ? '正在分析目标并制定计划' : '正在快速处理你的请求')
 ))
 const preparingResponseDetail = computed(() => (
-  activeProcessStep.value?.detail || '正在创建执行上下文，请稍候'
+  activeProcessStep.value?.detail
+  || (runResponseMode(activeRun.value) === 'expert' ? '将按步骤执行并验证结果' : '正在理解问题并选择最直接的处理方式')
 ))
-const renderedReasoning = computed(() => renderMarkdown(reasoningText.value))
 const selectedArtifactFile = computed(() => selectedArtifact.value?.content?.file)
 const selectedArtifactPreview = computed(() => selectedArtifact.value?.content?.preview)
 const activeCitations = computed(() => citationsFromEvents(events.value))
@@ -355,8 +382,10 @@ const sidebarTitle = computed(() => ({
   sources: '引用网页',
 }[sidebarMode.value]))
 const reasoningElapsedText = computed(() => formatElapsed(
-  Math.max(0, (isReasoning.value ? clockNow.value : reasoningEndedAt.value || clockNow.value)
-    - (reasoningStartedAt.value || clockNow.value)),
+  Math.max(
+    0,
+    (reasoningEndedAt.value || clockNow.value) - (reasoningStartedAt.value || clockNow.value),
+  ),
 ))
 const approvalRequest = computed(() => (
   activeRun.value?.status === 'waiting_approval'
@@ -445,6 +474,63 @@ function openArtifactPreview(artifact: RunArtifact): void {
   window.localStorage.setItem(EXECUTION_COLLAPSED_KEY, 'false')
 }
 
+function readExecutionWidth(): number {
+  if (typeof window === 'undefined') return 340
+  const rawStored = window.localStorage.getItem(EXECUTION_WIDTH_KEY)
+  if (rawStored === null) return 340
+  const stored = Number(rawStored)
+  return Number.isFinite(stored)
+    ? Math.min(MAX_EXECUTION_WIDTH, Math.max(MIN_EXECUTION_WIDTH, stored))
+    : 340
+}
+
+function maxExecutionWidth(): number {
+  if (typeof window === 'undefined') return MAX_EXECUTION_WIDTH
+  const sessionsWidth = sessionsCollapsed.value
+    ? 0
+    : window.matchMedia('(max-width: 1020px)').matches ? 220 : 252
+  return Math.max(
+    MIN_EXECUTION_WIDTH,
+    Math.min(MAX_EXECUTION_WIDTH, window.innerWidth - sessionsWidth - MIN_CHAT_WIDTH),
+  )
+}
+
+function setExecutionWidth(value: number, persist = false): void {
+  executionWidth.value = Math.min(maxExecutionWidth(), Math.max(MIN_EXECUTION_WIDTH, value))
+  if (persist) {
+    window.localStorage.setItem(EXECUTION_WIDTH_KEY, String(Math.round(executionWidth.value)))
+  }
+}
+
+function startExecutionResize(event: PointerEvent): void {
+  if (window.matchMedia('(max-width: 760px)').matches) return
+  event.preventDefault()
+  executionResizeStartX = event.clientX
+  executionResizeStartWidth = executionWidth.value
+  isExecutionResizing.value = true
+  window.addEventListener('pointermove', handleExecutionResize)
+  window.addEventListener('pointerup', stopExecutionResize)
+  window.addEventListener('pointercancel', stopExecutionResize)
+}
+
+function handleExecutionResize(event: PointerEvent): void {
+  if (!isExecutionResizing.value) return
+  setExecutionWidth(executionResizeStartWidth + executionResizeStartX - event.clientX)
+}
+
+function stopExecutionResize(): void {
+  if (!isExecutionResizing.value) return
+  isExecutionResizing.value = false
+  window.removeEventListener('pointermove', handleExecutionResize)
+  window.removeEventListener('pointerup', stopExecutionResize)
+  window.removeEventListener('pointercancel', stopExecutionResize)
+  window.localStorage.setItem(EXECUTION_WIDTH_KEY, String(Math.round(executionWidth.value)))
+}
+
+function resizeExecutionBy(delta: number): void {
+  setExecutionWidth(executionWidth.value + delta, true)
+}
+
 function openCitationSources(
   citations: SourceCitation[],
   selectedUrl = '',
@@ -486,6 +572,8 @@ function showExecutionTrace(): void {
 onBeforeUnmount(() => {
   closeEventSource()
   stopAnswerTimers()
+  stopReasoningTimers()
+  stopExecutionResize()
   if (clockTimer !== undefined) window.clearInterval(clockTimer)
 })
 
@@ -603,12 +691,55 @@ function onPaste(event: ClipboardEvent) {
   const html = clipboard.getData('text/html')
   const text = clipboard.getData('text/plain')
   const isTable = /<table[\s>]/i.test(html) || (text.includes('\t') && /\r?\n/.test(text))
-  if (!isTable) return
+  if (isTable) {
+    event.preventDefault()
+    attachments.value = []
+    tableHtml.value = html
+    tableText.value = text
+    submitError.value = ''
+    return
+  }
+
+  const target = event.target
+  if (!(target instanceof HTMLTextAreaElement) || !text) return
   event.preventDefault()
-  attachments.value = []
-  tableHtml.value = html
-  tableText.value = text
-  submitError.value = ''
+  const normalizedText = normalizePastedText(text)
+  const selectionStart = target.selectionStart ?? question.value.length
+  const selectionEnd = target.selectionEnd ?? selectionStart
+  question.value = question.value.slice(0, selectionStart)
+    + normalizedText
+    + question.value.slice(selectionEnd)
+  const caret = selectionStart + normalizedText.length
+  void nextTick(() => {
+    target.focus()
+    target.setSelectionRange(caret, caret)
+  })
+}
+
+function normalizePastedText(value: string): string {
+  const normalized = value
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u00a0\u2007\u202f\u3000]/g, ' ')
+    .replace(/[\u200b-\u200d\ufeff]/g, '')
+  if (looksLikeCodePaste(normalized)) return normalized
+  return normalized
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+}
+
+function looksLikeCodePaste(value: string): boolean {
+  if (/\x60{3}/.test(value)) return true
+  const lines = value.split('\n').filter((line) => line.trim())
+  if (lines.length < 2) return false
+  const codeSignals = lines.filter((line) => (
+    /^\s*(?:def|class|function|const|let|var|import|from|export|interface|type|SELECT|WITH)\b/i.test(line)
+    || /^\s*[}\])]?[;,]?$/.test(line)
+    || /^\s*[\w.-]+:\s+\S+/.test(line)
+    || /[{};]|=>|===|:=/.test(line)
+  )).length
+  return codeSignals >= 2
 }
 
 function onFileChange(event: Event) {
@@ -702,6 +833,21 @@ function clearTable() {
   submitError.value = ''
 }
 
+function selectResponseMode(mode: ResponseMode) {
+  if (isResponseActive.value || isSubmitting.value) return
+  responseMode.value = mode
+  window.localStorage.setItem(RESPONSE_MODE_KEY, mode)
+}
+
+function runResponseMode(run: RunSummary | null | undefined): ResponseMode {
+  if (run?.response_mode === 'expert' || run?.response_mode === 'fast') return run.response_mode
+  if (run?.result?.response_mode === 'expert' || run?.result?.response_mode === 'fast') {
+    return run.result.response_mode
+  }
+  if (run?.result?.execution_mode === 'planner') return 'expert'
+  return responseMode.value
+}
+
 async function submitRun() {
   // 普通问题不要求表格；只要问题非空且当前没有提交任务即可发送。
   if (!canSubmit.value) return
@@ -710,6 +856,7 @@ async function submitRun() {
   const submittedQuestion = question.value.trim()
   const submittedFiles = [...attachments.value]
   const requestedAgent = selectedAgent.value
+  const submittedMode = responseMode.value
   try {
     if (!selectedConversationId.value) {
       await createConversation()
@@ -719,6 +866,7 @@ async function submitRun() {
     if (submittedFiles.length) {
       const form = new FormData()
       form.append('question', submittedQuestion)
+      form.append('response_mode', submittedMode)
       if (requestedAgent) form.append('agent_key', requestedAgent)
       for (const file of submittedFiles) form.append('files', file, file.name)
       response = await apiPostForm<RunCreateResult>(
@@ -730,6 +878,7 @@ async function submitRun() {
         `/api/conversations/${selectedConversationId.value}/runs`,
         {
           question: submittedQuestion,
+          response_mode: submittedMode,
           ...(requestedAgent ? { agent_key: requestedAgent } : {}),
           table_text: tableText.value,
           table_html: tableHtml.value,
@@ -751,6 +900,7 @@ async function submitRun() {
       status: 'pending',
       question: submittedQuestion,
       agent_key: requestedAgent || undefined,
+      response_mode: response.response_mode || submittedMode,
       created_at: new Date().toISOString(),
       events: [],
       attachments: submittedFiles.map(summarizeFile),
@@ -793,7 +943,7 @@ async function rerunRun(sourceRun: RunSummary, revisedQuestion?: string) {
   try {
     const response = await apiPost<RunCreateResult>(
       `/api/runs/${sourceRun.id}/rerun`,
-      { question: submittedQuestion },
+      { question: submittedQuestion, response_mode: runResponseMode(sourceRun) },
     )
     const currentConversation = conversations.value.find(
       (conversation) => conversation.id === response.conversation_id,
@@ -809,6 +959,7 @@ async function rerunRun(sourceRun: RunSummary, revisedQuestion?: string) {
       status: 'pending',
       question: submittedQuestion,
       agent_key: sourceRun.agent_key,
+      response_mode: response.response_mode || runResponseMode(sourceRun),
       created_at: new Date().toISOString(),
       events: [],
       attachments: sourceRun.attachments || [],
@@ -847,7 +998,7 @@ async function cancelActiveRun() {
 
   // 点击后立即冻结可见内容；后端取消不应成为停止按钮的视觉延迟。
   freezeCurrentAnswer()
-  finishReasoning()
+  freezeCurrentReasoning()
   closeEventSource()
 
   if (!shouldCancelBackend) {
@@ -927,15 +1078,14 @@ async function copyRunQuestion(run: RunSummary) {
   }
 }
 
-async function retryRun() {
-  const sourceRun = activeRun.value
-  if (!sourceRun || sourceRun.status !== 'failed' || isRetrying.value) return
+async function retryRun(sourceRun: RunSummary | null = activeRun.value) {
+  if (!sourceRun || !['failed', 'cancelled'].includes(sourceRun.status) || isRetrying.value || isResponseActive.value) return
   isRetrying.value = true
   retryError.value = ''
   try {
     const response = await apiPost<RunCreateResult>(
       `/api/runs/${sourceRun.id}/retry`,
-      {},
+      { response_mode: runResponseMode(sourceRun) },
     )
     const currentConversation = conversations.value.find(
       (conversation) => conversation.id === response.conversation_id,
@@ -947,6 +1097,7 @@ async function retryRun() {
       status: 'pending',
       question: sourceRun.question,
       agent_key: sourceRun.agent_key,
+      response_mode: response.response_mode || runResponseMode(sourceRun),
       created_at: new Date().toISOString(),
       events: [],
       retry_of_run_id: sourceRun.id,
@@ -954,7 +1105,7 @@ async function retryRun() {
     }
     activeRun.value = pendingRun
     runs.value = [pendingRun, ...runs.value]
-    // 新运行使用独立事件序列；旧失败运行仍保留在数据库中供历史复查。
+    // 新运行使用独立事件序列；旧运行通过 retry_of_run_id 保留并归入同一轮。
     events.value = []
     toolRequests.value = []
     approvalError.value = ''
@@ -962,7 +1113,8 @@ async function retryRun() {
     connectEvents(response.run_id)
     await scrollMessagesToBottom(true)
   } catch (error) {
-    retryError.value = error instanceof Error ? error.message : '重新执行失败，请稍后重试。'
+    const fallback = sourceRun.status === 'cancelled' ? '重新开始失败，请稍后重试。' : '重新执行失败，请稍后重试。'
+    retryError.value = error instanceof Error ? error.message : fallback
   } finally {
     isRetrying.value = false
   }
@@ -1053,11 +1205,12 @@ async function appendEvent(raw: string) {
     if (activeRun.value) activeRun.value.status = wasCancelled ? 'cancelled' : activeRun.value.status
     if (wasCancelled) {
       freezeCurrentAnswer()
+      freezeCurrentReasoning()
     } else {
       answerStreamCompleted.value = true
       completeAnswerPlayback()
+      finishReasoning(event.occurred_at)
     }
-    finishReasoning(event.occurred_at)
     closeEventSource()
     await refreshRun(event.run_id, !wasCancelled, wasCancelled)
     await Promise.all([loadConversations(), refreshConversationContent(conversationId)])
@@ -1103,7 +1256,7 @@ async function refreshRun(runId: string, animateAnswer = true, preservePartialAn
   } else {
     setAnswerTarget(recoveredAnswer, animateAnswer)
   }
-  restoreReasoning(detail.run, events.value)
+  restoreReasoning(detail.run, events.value, animateAnswer)
   await scrollMessagesToBottom()
 }
 
@@ -1140,8 +1293,17 @@ function enqueueAnswerChunk(content: string) {
     : `${answerTarget.value}${content}`
   answerStreamCompleted.value = false
   answerPlaybackCompleted.value = false
+  startAnswerPlaybackIfReady(firstChunk ? FIRST_ANSWER_DELAY_MS : 0)
+}
+
+function startAnswerPlaybackIfReady(delay = TYPEWRITER_INTERVAL_MS) {
+  if (isReasoning.value || reasoningText.value.length < reasoningTarget.value.length) return
+  if (typedAnswer.value.length >= answerTarget.value.length) {
+    completeAnswerPlayback()
+    return
+  }
   isTyping.value = true
-  scheduleTypewriter(firstChunk ? FIRST_ANSWER_DELAY_MS : 0)
+  scheduleTypewriter(delay)
 }
 
 function scheduleTypewriter(delay = TYPEWRITER_INTERVAL_MS) {
@@ -1203,26 +1365,126 @@ function enqueueReasoningChunk(content: string, occurredAt: string) {
     reasoningStartedAt.value = parseServerTime(occurredAt) || Date.now()
   }
   reasoningEndedAt.value = null
-  reasoningText.value = `${reasoningText.value}${content}`
+  reasoningTarget.value = content.startsWith(reasoningTarget.value)
+    ? content
+    : `${reasoningTarget.value}${content}`
   isReasoning.value = true
   reasoningExpanded.value = true
-  void scrollReasoningToBottom()
+  scheduleReasoningTypewriter(0)
 }
 
 function finishReasoning(occurredAt?: string) {
-  if (isReasoning.value) {
-    isReasoning.value = false
+  if (reasoningStartedAt.value !== null) {
     reasoningEndedAt.value = occurredAt ? parseServerTime(occurredAt) : Date.now()
   }
-  if (reasoningText.value) reasoningExpanded.value = false
+  if (!reasoningTarget.value) {
+    isReasoning.value = false
+    startAnswerPlaybackIfReady(FIRST_ANSWER_DELAY_MS)
+    return
+  }
+  isReasoning.value = true
+  if (reasoningText.value.length < reasoningTarget.value.length) {
+    scheduleReasoningTypewriter(0)
+    return
+  }
+  completeReasoningPlayback()
 }
 
-function restoreReasoning(run: RunSummary, source: RunEvent[]) {
+function scheduleReasoningTypewriter(delay = REASONING_TYPEWRITER_INTERVAL_MS) {
+  if (reasoningTypewriterTimer !== undefined) return
+  reasoningTypewriterTimer = window.setTimeout(runReasoningTypewriterStep, delay)
+}
+
+function runReasoningTypewriterStep() {
+  reasoningTypewriterTimer = undefined
+  const remaining = reasoningTarget.value.length - reasoningText.value.length
+  if (remaining > 0) {
+    const step = remaining > 1200 ? 8 : remaining > 600 ? 5 : remaining > 240 ? 3 : remaining > 80 ? 2 : 1
+    reasoningText.value = reasoningTarget.value.slice(0, reasoningText.value.length + step)
+    scheduleReasoningMarkdownRender()
+    reasoningScrollTick += 1
+    if (reasoningScrollTick % 3 === 0) void scrollReasoningToBottom()
+  }
+
+  if (reasoningText.value.length < reasoningTarget.value.length) {
+    scheduleReasoningTypewriter()
+    return
+  }
+  scheduleReasoningMarkdownRender(true)
+  if (reasoningEndedAt.value !== null) completeReasoningPlayback()
+}
+
+function completeReasoningPlayback() {
+  if (reasoningEndedAt.value === null || reasoningText.value.length < reasoningTarget.value.length) return
+  isReasoning.value = false
+  if (reasoningText.value) reasoningExpanded.value = false
+  scheduleReasoningMarkdownRender(true)
+  startAnswerPlaybackIfReady(FIRST_ANSWER_DELAY_MS)
+  void scrollMessagesToBottom()
+}
+
+function scheduleReasoningMarkdownRender(immediate = false) {
+  if (immediate) {
+    if (reasoningMarkdownRenderTimer !== undefined) window.clearTimeout(reasoningMarkdownRenderTimer)
+    reasoningMarkdownRenderTimer = undefined
+    renderedReasoning.value = renderMarkdown(reasoningText.value)
+    return
+  }
+  if (reasoningMarkdownRenderTimer !== undefined) return
+  reasoningMarkdownRenderTimer = window.setTimeout(() => {
+    reasoningMarkdownRenderTimer = undefined
+    renderedReasoning.value = renderMarkdown(reasoningText.value)
+  }, MARKDOWN_RENDER_INTERVAL_MS)
+}
+
+function stopReasoningTimers() {
+  if (reasoningTypewriterTimer !== undefined) window.clearTimeout(reasoningTypewriterTimer)
+  if (reasoningMarkdownRenderTimer !== undefined) window.clearTimeout(reasoningMarkdownRenderTimer)
+  reasoningTypewriterTimer = undefined
+  reasoningMarkdownRenderTimer = undefined
+}
+
+function freezeCurrentReasoning() {
+  stopReasoningTimers()
+  reasoningTarget.value = reasoningText.value
+  if (reasoningStartedAt.value !== null && reasoningEndedAt.value === null) {
+    reasoningEndedAt.value = Date.now()
+  }
+  isReasoning.value = false
+  if (reasoningText.value) reasoningExpanded.value = false
+  scheduleReasoningMarkdownRender(true)
+}
+
+function restoreReasoning(run: RunSummary, source: RunEvent[], preservePlayback = false) {
   const reasoningEvents = source.filter((event) => event.type === 'message.reasoning.delta')
-  reasoningText.value = String(run.result?.reasoning || '')
+  const restoredReasoning = String(run.result?.reasoning || '')
     || reasoningEvents.map((event) => String(event.payload.content || '')).join('')
   const first = reasoningEvents[0]
   const last = reasoningEvents[reasoningEvents.length - 1]
+  const closingEvent = last ? source.find((event) => (
+    event.sequence > last.sequence
+    && (event.type === 'message.delta' || event.type === 'run.completed' || event.type === 'run.failed' || event.type === 'run.cancelled')
+  )) : undefined
+
+  if (preservePlayback && (reasoningTarget.value || reasoningText.value)) {
+    reasoningTarget.value = restoredReasoning.startsWith(reasoningTarget.value)
+      ? restoredReasoning
+      : reasoningTarget.value
+    if (reasoningStartedAt.value === null && first) {
+      reasoningStartedAt.value = parseServerTime(first.occurred_at)
+    }
+    if (closingEvent) reasoningEndedAt.value = parseServerTime(closingEvent.occurred_at)
+    isReasoning.value = !closingEvent || reasoningText.value.length < reasoningTarget.value.length
+    reasoningExpanded.value = isReasoning.value
+    if (reasoningText.value.length < reasoningTarget.value.length) scheduleReasoningTypewriter(0)
+    else if (closingEvent) completeReasoningPlayback()
+    return
+  }
+
+  stopReasoningTimers()
+  reasoningTarget.value = restoredReasoning
+  reasoningText.value = restoredReasoning
+  renderedReasoning.value = renderMarkdown(restoredReasoning)
   reasoningStartedAt.value = first ? parseServerTime(first.occurred_at) : null
   if (!last) {
     reasoningEndedAt.value = null
@@ -1230,10 +1492,6 @@ function restoreReasoning(run: RunSummary, source: RunEvent[]) {
     reasoningExpanded.value = false
     return
   }
-  const closingEvent = source.find((event) => (
-    event.sequence > last.sequence
-    && (event.type === 'message.delta' || event.type === 'run.completed' || event.type === 'run.failed' || event.type === 'run.cancelled')
-  ))
   isReasoning.value = !closingEvent && ['running', 'pending'].includes(run.status)
   reasoningEndedAt.value = closingEvent ? parseServerTime(closingEvent.occurred_at) : null
   reasoningExpanded.value = isReasoning.value
@@ -1260,12 +1518,7 @@ function setAnswerTarget(answer: string, animate: boolean) {
     completeAnswerPlayback()
     return
   }
-  isTyping.value = true
-  if (typedAnswer.value.length >= answerTarget.value.length) {
-    completeAnswerPlayback()
-    return
-  }
-  scheduleTypewriter(typedAnswer.value ? 0 : FIRST_ANSWER_DELAY_MS)
+  startAnswerPlaybackIfReady(typedAnswer.value ? 0 : FIRST_ANSWER_DELAY_MS)
 }
 
 function renderMarkdown(value: string): string {
@@ -1278,6 +1531,7 @@ function renderMarkdown(value: string): string {
 
 function resetTypewriter() {
   stopAnswerTimers()
+  stopReasoningTimers()
   answerTarget.value = ''
   typedAnswer.value = ''
   renderedAnswer.value = ''
@@ -1286,11 +1540,14 @@ function resetTypewriter() {
   answerPlaybackCompleted.value = false
   typewriterScrollTick = 0
   reasoningText.value = ''
+  reasoningTarget.value = ''
+  renderedReasoning.value = ''
   isReasoning.value = false
   reasoningExpanded.value = true
   reasoningStartedAt.value = null
   reasoningEndedAt.value = null
   reasoningAutoFollow.value = true
+  reasoningScrollTick = 0
 }
 
 function formatElapsed(milliseconds: number): string {
@@ -1639,12 +1896,13 @@ function buildProcessSteps(source: RunEvent[], runStatus: string): ProcessStep[]
     }
     if (event.type === 'tool.started') {
       const tool = String(event.payload.tool || 'tool')
+      const toolDisplayName = String(event.payload.tool_display_name || '')
       const args = (event.payload.args || {}) as Record<string, unknown>
       const command = String(args.command || '').trim()
       const requestId = String(event.payload.request_id || event.sequence)
       activate({
         id: `tool-${requestId}`,
-        title: toolStepTitle(tool),
+        title: toolStepTitle(tool, toolDisplayName),
         detail: command ? `执行：${truncateText(command, 120)}` : '工具正在处理所需数据',
         occurredAt,
         status: 'active',
@@ -1655,9 +1913,10 @@ function buildProcessSteps(source: RunEvent[], runStatus: string): ProcessStep[]
     if (event.type === 'tool.completed') {
       const requestId = String(event.payload.request_id || '')
       const tool = String(event.payload.tool || '')
+      const toolDisplayName = String(event.payload.tool_display_name || '')
       const step = [...steps].reverse().find((item) => (
         item.status === 'active'
-        && (requestId ? item.id === `tool-${requestId}` : item.title === toolStepTitle(tool))
+        && (requestId ? item.id === `tool-${requestId}` : item.title === toolStepTitle(tool, toolDisplayName))
       ))
       if (step) {
         if (event.payload.blocked_by_policy) {
@@ -1710,8 +1969,13 @@ function buildProcessSteps(source: RunEvent[], runStatus: string): ProcessStep[]
 function processStageDefinition(stage: string) {
   const definitions: Record<string, { id: string; title: string; detail: string }> = {
     recognize_intent: { id: 'intent', title: '理解你的目标', detail: '正在判断最合适的处理方式' },
+    select_mode: { id: 'mode', title: '选择回答模式', detail: '正在应用本次请求的执行策略' },
+    fast_prepare: { id: 'fast', title: '准备快速响应', detail: '正在载入可用工具和会话信息' },
+    fast_think: { id: 'fast-answer', title: '快速处理请求', detail: '正在直接回答或选择必要工具' },
     dispatch_agent: { id: 'route', title: '选择合适的处理能力', detail: '已根据内容自动分配专业 Agent' },
     analyze_task: { id: 'plan', title: '分析任务并制定计划', detail: '正在拆解目标和所需步骤' },
+    create_plan: { id: 'create-plan', title: '生成执行计划', detail: '正在生成可验证的执行步骤' },
+    replan: { id: 'replan', title: '调整执行计划', detail: '正在根据执行结果修复后续计划' },
     think: { id: 'reason', title: '规划下一步操作', detail: '正在判断是否需要使用工具' },
     direct_chat: { id: 'answer', title: '组织最终答复', detail: '正在生成回复内容' },
     parse_input: { id: 'parse', title: '读取考勤数据', detail: '正在解析输入表格' },
@@ -1730,16 +1994,38 @@ function processStageDefinition(stage: string) {
   return definitions[stage]
 }
 
-function toolStepTitle(tool: string): string {
+function toolStepTitle(tool: string, displayName = ''): string {
+  if (displayName.trim()) return displayName.trim()
   const labels: Record<string, string> = {
     run_shell: '在隔离环境执行命令',
     read_file: '读取工作区文件',
+    web_search: '搜索互联网',
     web_fetch: '获取网页内容',
-    database_query: '查询业务数据',
+    query_database: '查询业务数据',
     create_excel_artifact: '生成 Excel 文件',
     create_word_artifact: '生成 Word 文档',
+    create_pdf_artifact: '生成 PDF 文档',
+    'mcp__fuecn-internal__demo_order_lookup': '查询订单状态',
+    'mcp__12306mcp__get-current-time': '获取当前时间',
+    'mcp__12306mcp__query-tickets': '查询火车票',
+    'mcp__12306mcp__query-transfer': '查询中转换乘',
+    'mcp__12306mcp__query-train-route': '查询列车经停站',
+    'mcp__12306mcp__search-stations': '查询车站信息',
+    'mcp__12306mcp__query-ticket-price': '查询车票价格',
+    mcp__amapmcp__maps_geo: '解析地址位置',
+    mcp__amapmcp__maps_regeocode: '解析坐标位置',
+    mcp__amapmcp__maps_ip_location: '查询 IP 位置',
+    mcp__amapmcp__maps_weather: '查询天气',
+    mcp__amapmcp__maps_search_detail: '查询地点详情',
+    mcp__amapmcp__maps_text_search: '搜索地点',
+    mcp__amapmcp__maps_around_search: '搜索周边地点',
+    mcp__amapmcp__maps_distance: '计算路线距离',
+    mcp__amapmcp__maps_direction_walking: '查询步行路线',
+    mcp__amapmcp__maps_direction_driving: '查询驾车路线',
+    mcp__amapmcp__maps_direction_bicycling: '查询骑行路线',
+    mcp__amapmcp__maps_direction_transit_integrated: '查询公交路线',
   }
-  return labels[tool] || `使用工具：${tool || '未知工具'}`
+  return labels[tool] || '调用外部工具'
 }
 
 function truncateText(value: string, maxLength: number): string {
@@ -1747,6 +2033,10 @@ function truncateText(value: string, maxLength: number): string {
 }
 
 function eventStage(event: RunEvent): string {
+  if (event.type === 'tool.started') return '调用工具'
+  if (event.type === 'tool.completed') {
+    return event.payload.ok === false ? '工具调用失败' : '工具调用完成'
+  }
   const stage = String(event.payload.stage || event.type)
   const labels: Record<string, string> = {
     recognize_intent: '理解需求',
@@ -1782,6 +2072,11 @@ function eventMessage(event: RunEvent): string {
   if (event.type === 'approval.resolved') {
     return event.payload.action === 'approve' ? '已授权，准备进入隔离环境执行。' : '已拒绝执行。'
   }
+  if ((event.type === 'tool.started' || event.type === 'tool.completed') && event.payload.tool) {
+    const toolName = String(event.payload.tool)
+    if (event.type === 'tool.started') return `开始调用：${toolName}`
+    return event.payload.ok === false ? `调用失败：${toolName}` : `调用完成：${toolName}`
+  }
   const message = String(event.payload.message || event.payload.content || event.type)
   if (event.type !== 'run.failed') return message
 
@@ -1808,9 +2103,11 @@ function formatTime(value: string): string {
 <template>
   <main
     class="shell"
+    :style="{ '--execution-width': executionCollapsed ? '0px' : executionWidth + 'px' }"
     :class="{
       'sessions-collapsed': sessionsCollapsed,
       'execution-collapsed': executionCollapsed,
+      'execution-resizing': isExecutionResizing,
     }"
   >
     <aside v-if="!sessionsCollapsed" class="sessions" aria-label="会话列表">
@@ -1904,7 +2201,7 @@ function formatTime(value: string): string {
       <div ref="messageScroll" class="message-scroll" @scroll="handleMessageScroll">
         <section v-if="!historicalTurns.length && !activeRun" class="empty-chat">
           <p>智能任务协作</p>
-          <h1>描述目标，Agent 会自动选择处理方式。</h1>
+          <!-- <h1>描述目标，Agent 会自动选择处理方式。</h1> -->
           <span>直接提问，或添加 Excel 数据；系统会自动识别意图、选择能力，并清晰展示处理过程。</span>
         </section>
 
@@ -1974,7 +2271,8 @@ function formatTime(value: string): string {
           </article>
           <article class="message assistant run-message">
             <div class="avatar agent-avatar">A</div>
-            <section class="agent-panel historical-agent-panel">
+            <div class="agent-response-column">
+              <section class="agent-panel historical-agent-panel">
               <header class="agent-message-header">
                 <div>
                   <strong>{{ agentDisplayName(turn.latestRun.agent_key) }}</strong>
@@ -2004,7 +2302,7 @@ function formatTime(value: string): string {
               </div>
               <div v-else-if="turn.latestRun.status === 'cancelled'" class="run-cancelled compact-cancelled">
                 <span>回答已停止</span>
-                <button type="button" :disabled="isRetrying || isResponseActive" @click="rerunRun(turn.latestRun)">重新开始</button>
+                <button type="button" :disabled="isRetrying || isResponseActive" @click="retryRun(turn.latestRun)">重新开始</button>
               </div>
               <button
                 v-if="runCitations(turn.latestRun).length"
@@ -2020,27 +2318,6 @@ function formatTime(value: string): string {
                 </span>
                 <strong>{{ runCitations(turn.latestRun).length }} 个网页</strong>
               </button>
-              <div v-if="runAnswer(turn.latestRun)" class="answer-actions" aria-label="回答操作">
-                <button
-                  type="button"
-                  :class="{ 'is-copied': copiedAnswerRunId === turn.latestRun.id }"
-                  :aria-label="copiedAnswerRunId === turn.latestRun.id ? '已复制回答' : '复制回答'"
-                  :title="copiedAnswerRunId === turn.latestRun.id ? '已复制' : '复制回答'"
-                  @click="copyRunAnswer(turn.latestRun)"
-                >
-                  <svg v-if="copiedAnswerRunId === turn.latestRun.id" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>
-                  <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
-                </button>
-                <button
-                  type="button"
-                  aria-label="重新生成回答"
-                  title="重新生成"
-                  :disabled="isRetrying || isResponseActive"
-                  @click="rerunRun(turn.latestRun)"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"></path><path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path></svg>
-                </button>
-              </div>
               <section v-if="runArtifacts(turn.latestRun).length" class="artifact-deliveries compact-artifacts">
                 <header><strong>生成文件</strong><span>{{ runArtifacts(turn.latestRun).length }} 个</span></header>
                 <div class="artifact-delivery-list">
@@ -2064,7 +2341,29 @@ function formatTime(value: string): string {
                   </article>
                 </div>
               </section>
-            </section>
+              </section>
+              <div v-if="runAnswer(turn.latestRun)" class="answer-actions" aria-label="回答操作">
+                <button
+                  type="button"
+                  :class="{ 'is-copied': copiedAnswerRunId === turn.latestRun.id }"
+                  :aria-label="copiedAnswerRunId === turn.latestRun.id ? '已复制回答' : '复制回答'"
+                  :title="copiedAnswerRunId === turn.latestRun.id ? '已复制' : '复制回答'"
+                  @click="copyRunAnswer(turn.latestRun)"
+                >
+                  <svg v-if="copiedAnswerRunId === turn.latestRun.id" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>
+                  <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+                </button>
+                <button
+                  type="button"
+                  aria-label="重新生成回答"
+                  title="重新生成"
+                  :disabled="isRetrying || isResponseActive"
+                  @click="rerunRun(turn.latestRun)"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"></path><path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path></svg>
+                </button>
+              </div>
+            </div>
           </article>
         </section>
 
@@ -2134,7 +2433,8 @@ function formatTime(value: string): string {
           </article>
           <article class="message assistant run-message">
             <div class="avatar agent-avatar">A</div>
-            <section class="agent-panel">
+            <div class="agent-response-column">
+              <section class="agent-panel">
               <header class="agent-message-header">
                 <div>
                   <strong>{{ activeAgent?.display_name || 'Agent' }}</strong>
@@ -2220,6 +2520,35 @@ function formatTime(value: string): string {
                 </Transition>
               </section>
 
+              <div v-if="summary" class="metric-grid">
+                <div><span>人数</span><strong>{{ summary.employee_count }}</strong></div>
+                <div><span>出勤</span><strong>{{ summary.total_attendance_days }} 天</strong></div>
+                <div><span>迟到</span><strong>{{ summary.total_late_count }} 次</strong></div>
+                <div><span>扣款</span><strong>{{ summary.total_deduction }} 元</strong></div>
+              </div>
+              <div v-if="visibleEmployees.length" class="result-table-wrap">
+                <table class="result-table">
+                  <thead>
+                    <tr>
+                      <th>姓名</th>
+                      <th>出勤</th>
+                      <th>迟到</th>
+                      <th>缺卡</th>
+                      <th>扣款</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in visibleEmployees" :key="String(row.name)">
+                      <td>{{ row.name }}</td>
+                      <td>{{ row.attendance_days }}</td>
+                      <td>{{ row.late_count }}</td>
+                      <td>{{ row.missing_punch_count }}</td>
+                      <td>{{ row.deduction }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
               <div
                 v-if="typedAnswer || isTyping"
                 class="answer-text"
@@ -2250,32 +2579,6 @@ function formatTime(value: string): string {
                 <strong>{{ activeCitations.length }} 个网页</strong>
               </button>
 
-              <div
-                v-if="answerPlaybackCompleted && typedAnswer && !isRunActive"
-                class="answer-actions"
-                aria-label="回答操作"
-              >
-                <button
-                  type="button"
-                  :class="{ 'is-copied': copiedAnswerRunId === activeRun.id }"
-                  :aria-label="copiedAnswerRunId === activeRun.id ? '已复制回答' : '复制回答'"
-                  :title="copiedAnswerRunId === activeRun.id ? '已复制' : '复制回答'"
-                  @click="copyRunAnswer(activeRun)"
-                >
-                  <svg v-if="copiedAnswerRunId === activeRun.id" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>
-                  <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
-                </button>
-                <button
-                  type="button"
-                  aria-label="重新生成回答"
-                  title="重新生成"
-                  :disabled="isRetrying || isResponseActive"
-                  @click="rerunRun(activeRun)"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"></path><path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path></svg>
-                </button>
-              </div>
-
               <section v-if="showActiveArtifacts && runArtifacts(activeRun).length" class="artifact-deliveries">
                 <header><strong>已生成文件</strong><span>可下载并继续使用</span></header>
                 <div class="artifact-delivery-list">
@@ -2305,7 +2608,7 @@ function formatTime(value: string): string {
                   <strong>已停止生成</strong>
                   <span>已保留当前回答、执行轨迹和已生成文件。</span>
                 </div>
-                <button type="button" :disabled="isRetrying" @click="rerunRun(activeRun)">
+                <button type="button" :disabled="isRetrying" @click="retryRun(activeRun)">
                   {{ isRetrying ? '正在重新开始…' : '重新开始' }}
                 </button>
               </div>
@@ -2314,41 +2617,39 @@ function formatTime(value: string): string {
                 <p>{{ failureDetail }}</p>
                 <div class="run-error-actions">
                   <span v-if="retryError">{{ retryError }}</span>
-                  <button type="button" :disabled="isRetrying" @click="retryRun">
+                  <button type="button" :disabled="isRetrying" @click="retryRun()">
                     {{ isRetrying ? '正在重新执行…' : '重新执行' }}
                   </button>
                 </div>
               </div>
 
-              <div v-if="summary" class="metric-grid">
-                <div><span>人数</span><strong>{{ summary.employee_count }}</strong></div>
-                <div><span>出勤</span><strong>{{ summary.total_attendance_days }} 天</strong></div>
-                <div><span>迟到</span><strong>{{ summary.total_late_count }} 次</strong></div>
-                <div><span>扣款</span><strong>{{ summary.total_deduction }} 元</strong></div>
+              </section>
+              <div
+                v-if="answerPlaybackCompleted && typedAnswer && !isRunActive"
+                class="answer-actions"
+                aria-label="回答操作"
+              >
+                <button
+                  type="button"
+                  :class="{ 'is-copied': copiedAnswerRunId === activeRun.id }"
+                  :aria-label="copiedAnswerRunId === activeRun.id ? '已复制回答' : '复制回答'"
+                  :title="copiedAnswerRunId === activeRun.id ? '已复制' : '复制回答'"
+                  @click="copyRunAnswer(activeRun)"
+                >
+                  <svg v-if="copiedAnswerRunId === activeRun.id" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>
+                  <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+                </button>
+                <button
+                  type="button"
+                  aria-label="重新生成回答"
+                  title="重新生成"
+                  :disabled="isRetrying || isResponseActive"
+                  @click="rerunRun(activeRun)"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"></path><path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path></svg>
+                </button>
               </div>
-              <div v-if="visibleEmployees.length" class="result-table-wrap">
-                <table class="result-table">
-                  <thead>
-                    <tr>
-                      <th>姓名</th>
-                      <th>出勤</th>
-                      <th>迟到</th>
-                      <th>缺卡</th>
-                      <th>扣款</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="row in visibleEmployees" :key="String(row.name)">
-                      <td>{{ row.name }}</td>
-                      <td>{{ row.attendance_days }}</td>
-                      <td>{{ row.late_count }}</td>
-                      <td>{{ row.missing_punch_count }}</td>
-                      <td>{{ row.deduction }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </section>
+            </div>
           </article>
         </section>
       </div>
@@ -2360,6 +2661,32 @@ function formatTime(value: string): string {
         @dragleave.prevent="isDragging = false"
         @drop.prevent="onDrop"
       >
+        <div class="response-mode-bar">
+          <div
+            class="response-mode-picker"
+            :class="{ 'is-expert': responseMode === 'expert' }"
+            role="group"
+            aria-label="回答模式"
+          >
+            <span class="response-mode-slider" aria-hidden="true"></span>
+            <button
+              type="button"
+              :class="{ active: responseMode === 'fast' }"
+              :aria-pressed="responseMode === 'fast'"
+              :disabled="isResponseActive || isSubmitting"
+              title="优先响应，适合日常问答和简单工具任务"
+              @click="selectResponseMode('fast')"
+            ><span aria-hidden="true">⚡</span>快速模式</button>
+            <button
+              type="button"
+              :class="{ active: responseMode === 'expert' }"
+              :aria-pressed="responseMode === 'expert'"
+              :disabled="isResponseActive || isSubmitting"
+              title="先规划再执行，适合复杂和高准确度任务"
+              @click="selectResponseMode('expert')"
+            ><span aria-hidden="true">✦</span>专家模式</button>
+          </div>
+        </div>
         <div class="composer" :class="{ dragging: isDragging }">
           <section v-if="hasTable" class="composer-attachments" aria-label="已添加的附件">
             <div class="attachment-grid">
@@ -2434,6 +2761,21 @@ function formatTime(value: string): string {
         <p v-if="submitError" class="composer-error">{{ submitError }}</p>
       </footer>
     </section>
+
+    <div
+      v-if="!executionCollapsed"
+      class="execution-resizer"
+      role="separator"
+      aria-label="调整右侧面板宽度"
+      aria-orientation="vertical"
+      :aria-valuemin="MIN_EXECUTION_WIDTH"
+      :aria-valuemax="MAX_EXECUTION_WIDTH"
+      :aria-valuenow="Math.round(executionWidth)"
+      tabindex="0"
+      @pointerdown="startExecutionResize"
+      @keydown.left.prevent="resizeExecutionBy(20)"
+      @keydown.right.prevent="resizeExecutionBy(-20)"
+    ></div>
 
     <aside
       v-if="!executionCollapsed"
