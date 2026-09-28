@@ -122,8 +122,38 @@ type AttendanceSummary = {
   total_late_count: number
   total_missing_punch_count: number
   total_deduction: number
-  employees: Array<Record<string, string | number>>
+  employees: AttendanceEmployee[]
+  focus_employees?: AttendanceEmployee[]
   warnings: string[]
+}
+
+type AttendanceExceptionType = 'late' | 'early_leave' | 'missing'
+
+type AttendanceExceptionEvent = {
+  punch_type: string
+  expected_time: string
+  actual_time: string
+  status: string
+}
+
+type AttendanceExceptionDetail = {
+  date: string
+  events: AttendanceExceptionEvent[]
+  machine_punches: string[]
+  reason: string
+}
+
+type AttendanceEmployee = {
+  employee_key?: string
+  name: string
+  attendance_days: number
+  late_count: number
+  early_leave_count?: number
+  missing_punch_count: number
+  deduction: number
+  correction_count?: number
+  attention_reasons?: string[]
+  exception_details?: Partial<Record<AttendanceExceptionType, AttendanceExceptionDetail[]>>
 }
 
 type RunEvent = {
@@ -168,6 +198,8 @@ type ProcessStep = {
   meta?: string
 }
 
+type UploadStage = 'uploading' | 'processing'
+
 // 页面状态按“可选 Agent、持久化会话、当前运行”三类组织，避免相互覆盖。
 const agents = ref<AgentInfo[]>([])
 const conversations = ref<Conversation[]>([])
@@ -192,6 +224,7 @@ const isDragging = ref(false)
 const submitError = ref('')
 const retryError = ref('')
 const isSubmitting = ref(false)
+const pendingUploadFiles = ref<File[]>([])
 const isRetrying = ref(false)
 const isStopping = ref(false)
 const editingRunId = ref('')
@@ -428,8 +461,94 @@ const failureDetail = computed(() => {
 })
 const summary = computed(() => activeRun.value?.result?.analysis_result)
 const activeConversation = computed(() => conversations.value.find((item) => item.id === selectedConversationId.value))
-const visibleEmployees = computed(() => summary.value?.employees?.slice(0, 8) || [])
+const focusEmployees = computed(() => {
+  const rows = summary.value?.focus_employees ?? summary.value?.employees ?? []
+  return rows.filter((row) => (
+    Number(row.missing_punch_count || 0) > 0
+    || Number(row.late_count || 0) > 0
+    || Number(row.early_leave_count || 0) > 0
+  ))
+})
+const employeeAttentionText = (row: AttendanceEmployee) => {
+  if (row.attention_reasons?.length) return row.attention_reasons.join('、')
+  const reasons: string[] = []
+  if (row.missing_punch_count) reasons.push(`缺卡${row.missing_punch_count}次`)
+  if (row.late_count) reasons.push(`迟到${row.late_count}次`)
+  if (row.early_leave_count) reasons.push(`早退${row.early_leave_count}次`)
+  if (row.correction_count) reasons.push(`考勤修正${row.correction_count}条`)
+  return reasons.join('、')
+}
+const exceptionMetrics = [
+  { type: 'late', countKey: 'late_count', label: '迟到' },
+  { type: 'early_leave', countKey: 'early_leave_count', label: '早退' },
+  { type: 'missing', countKey: 'missing_punch_count', label: '缺卡' },
+] as const
+type ExceptionMetric = (typeof exceptionMetrics)[number]
+type ActiveExceptionTip = {
+  key: string
+  row: AttendanceEmployee
+  metric: ExceptionMetric
+  top: number
+  left: number
+}
+const activeExceptionTip = ref<ActiveExceptionTip | null>(null)
+const exceptionTipPanel = ref<HTMLElement | null>(null)
+const employeeExceptionDetails = (
+  row: AttendanceEmployee,
+  type: AttendanceExceptionType,
+) => row.exception_details?.[type] || []
+const activeExceptionDetails = computed(() => {
+  const tip = activeExceptionTip.value
+  return tip ? employeeExceptionDetails(tip.row, tip.metric.type) : []
+})
+
+async function toggleExceptionTip(
+  event: MouseEvent,
+  row: AttendanceEmployee,
+  metric: ExceptionMetric,
+) {
+  event.stopPropagation()
+  const key = `${row.employee_key || row.name}:${metric.type}`
+  if (activeExceptionTip.value?.key === key) {
+    activeExceptionTip.value = null
+    return
+  }
+  const trigger = event.currentTarget as HTMLElement
+  const rect = trigger.getBoundingClientRect()
+  const panelWidth = Math.min(430, window.innerWidth - 24)
+  const left = Math.max(12, Math.min(rect.left, window.innerWidth - panelWidth - 12))
+  activeExceptionTip.value = { key, row, metric, top: rect.bottom + 8, left }
+  await nextTick()
+  const currentTip = activeExceptionTip.value
+  if (!currentTip || currentTip.key !== key) return
+  const panelHeight = exceptionTipPanel.value?.getBoundingClientRect().height || 0
+  if (rect.bottom + 8 + panelHeight > window.innerHeight - 12) {
+    activeExceptionTip.value = {
+      ...currentTip,
+      top: Math.max(12, rect.top - panelHeight - 8),
+    }
+  }
+}
+
+function closeExceptionTip(event?: Event) {
+  if (
+    event?.target instanceof Element
+    && event.target.closest('.exception-tip-trigger')
+  ) return
+  if (
+    event?.target instanceof Node
+    && exceptionTipPanel.value?.contains(event.target)
+  ) return
+  activeExceptionTip.value = null
+}
+
+function handleExceptionTipKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeExceptionTip()
+}
 const runStatusText = computed(() => {
+  if (isLocalUploadRun(activeRun.value)) {
+    return activeRun.value?.status === 'failed' ? '附件处理失败' : '正在处理附件'
+  }
   const labels: Record<string, string> = {
     pending: '等待执行',
     running: '执行中',
@@ -443,6 +562,10 @@ const runStatusText = computed(() => {
 
 // Agent 与会话列表互不依赖，初始化时并行加载以缩短首屏等待。
 onMounted(async () => {
+  document.addEventListener('pointerdown', closeExceptionTip)
+  document.addEventListener('keydown', handleExceptionTipKeydown)
+  window.addEventListener('resize', closeExceptionTip)
+  window.addEventListener('scroll', closeExceptionTip, true)
   clockTimer = window.setInterval(() => { clockNow.value = Date.now() }, 100)
   approvalKey.value = window.sessionStorage.getItem('fuecn-tool-approval-key') || ''
   await Promise.all([loadAgents(), loadConversations()])
@@ -570,6 +693,10 @@ function showExecutionTrace(): void {
 }
 
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', closeExceptionTip)
+  document.removeEventListener('keydown', handleExceptionTipKeydown)
+  window.removeEventListener('resize', closeExceptionTip)
+  window.removeEventListener('scroll', closeExceptionTip, true)
   closeEventSource()
   stopAnswerTimers()
   stopReasoningTimers()
@@ -606,14 +733,24 @@ async function createConversation() {
   await selectConversation(conversation.id)
 }
 
+async function createConversationForSubmission() {
+  const conversation = await apiPost<Conversation>('/api/conversations', { title: '新的会话' })
+  conversations.value = [conversation, ...conversations.value]
+  selectedConversationId.value = conversation.id
+  messages.value = []
+  runs.value = []
+}
+
 async function selectConversation(id: string) {
   // 切换会话前关闭旧 SSE，防止旧运行事件写入新会话界面。
+  closeExceptionTip()
   selectedConversationId.value = id
   closeEventSource()
   events.value = []
   toolRequests.value = []
   approvalError.value = ''
   retryError.value = ''
+  pendingUploadFiles.value = []
   isStopping.value = false
   cancelEditing()
   activeRun.value = null
@@ -656,6 +793,7 @@ async function deleteConversation(conversation: Conversation) {
     toolRequests.value = []
     activeRunId.value = ''
     activeRun.value = null
+    pendingUploadFiles.value = []
     const nextConversation = conversations.value[0]
     if (nextConversation) {
       await selectConversation(nextConversation.id)
@@ -752,11 +890,13 @@ function onFileChange(event: Event) {
 
 function onDrop(event: DragEvent) {
   isDragging.value = false
+  if (isSubmitting.value) return
   const files = Array.from(event.dataTransfer?.files || [])
   if (files.length) addAttachments(files)
 }
 
 function addAttachments(files: File[]) {
+  if (isSubmitting.value) return
   const next = [...attachments.value]
   for (const file of files) {
     const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
@@ -788,6 +928,7 @@ function addAttachments(files: File[]) {
 }
 
 function removeAttachment(index: number) {
+  if (isSubmitting.value) return
   attachments.value.splice(index, 1)
 }
 
@@ -819,6 +960,7 @@ function turnAttachments(turn: ConversationTurn): AttachmentSummary[] {
 }
 
 function openFilePicker() {
+  if (isSubmitting.value) return
   fileInput.value?.click()
 }
 
@@ -848,22 +990,112 @@ function runResponseMode(run: RunSummary | null | undefined): ResponseMode {
   return responseMode.value
 }
 
+function isLocalUploadRun(run: RunSummary | null | undefined): boolean {
+  return Boolean(run?.id.startsWith('local-upload-'))
+}
+
+function localUploadEvent(
+  runId: string,
+  sequence: number,
+  type: string,
+  stage: string,
+  message: string,
+): RunEvent {
+  return {
+    event_id: `local-${runId}-${sequence}`,
+    run_id: runId,
+    sequence,
+    type,
+    occurred_at: new Date().toISOString(),
+    payload: { stage, message },
+  }
+}
+
+function updateLocalUploadStage(
+  runId: string,
+  fileCount: number,
+  totalBytes: number,
+  percent: number,
+  stage: UploadStage,
+) {
+  if (activeRun.value?.id !== runId) return
+  if (stage === 'uploading') {
+    const uploadedBytes = Math.round(totalBytes * percent / 100)
+    const message = `正在上传 ${fileCount} 个附件 · ${percent}% · ${formatFileSize(uploadedBytes)} / ${formatFileSize(totalBytes)}`
+    const current = events.value.find((event) => event.run_id === runId && event.payload.stage === 'upload_files')
+    if (current) current.payload.message = message
+    return
+  }
+  events.value = [
+    localUploadEvent(runId, 1, 'tool.started', 'prepare_upload', `正在准备 ${fileCount} 个附件`),
+    localUploadEvent(runId, 2, 'tool.completed', 'prepare_upload', '附件准备完成'),
+    localUploadEvent(runId, 3, 'tool.started', 'upload_files', `正在上传 ${fileCount} 个附件`),
+    localUploadEvent(runId, 4, 'tool.completed', 'upload_files', '附件上传完成'),
+    localUploadEvent(runId, 5, 'tool.started', 'parse_attachments', '文件已传输完成，正在读取并解析附件内容'),
+  ]
+}
+
 async function submitRun() {
   // 普通问题不要求表格；只要问题非空且当前没有提交任务即可发送。
   if (!canSubmit.value) return
   isSubmitting.value = true
+  closeExceptionTip()
   submitError.value = ''
   const submittedQuestion = question.value.trim()
   const submittedFiles = [...attachments.value]
   const requestedAgent = selectedAgent.value
   const submittedMode = responseMode.value
+  const totalUploadBytes = submittedFiles.reduce((total, file) => total + file.size, 0)
+  let localUploadRunId = ''
   try {
+    if (submittedFiles.length) {
+      localUploadRunId = `local-upload-${crypto.randomUUID()}`
+      pendingUploadFiles.value = submittedFiles
+      closeEventSource()
+      activeRunId.value = localUploadRunId
+      activeRun.value = {
+        id: localUploadRunId,
+        status: 'pending',
+        question: submittedQuestion,
+        agent_key: requestedAgent || undefined,
+        response_mode: submittedMode,
+        created_at: new Date().toISOString(),
+        events: [],
+        attachments: submittedFiles.map(summarizeFile),
+      }
+      selectedArtifact.value = null
+      sourcePanelCitations.value = []
+      selectedCitation.value = null
+      sidebarMode.value = 'trace'
+      events.value = [
+        localUploadEvent(
+          localUploadRunId,
+          1,
+          'tool.started',
+          'prepare_upload',
+          `正在准备 ${submittedFiles.length} 个附件并创建任务上下文`,
+        ),
+      ]
+      toolRequests.value = []
+      approvalError.value = ''
+      resetTypewriter()
+      question.value = ''
+      tableText.value = ''
+      tableHtml.value = ''
+      attachments.value = []
+      await scrollMessagesToBottom(true)
+    }
     if (!selectedConversationId.value) {
-      await createConversation()
+      await createConversationForSubmission()
     }
 
     let response: RunCreateResult
     if (submittedFiles.length) {
+      events.value = [
+        localUploadEvent(localUploadRunId, 1, 'tool.started', 'prepare_upload', `正在准备 ${submittedFiles.length} 个附件`),
+        localUploadEvent(localUploadRunId, 2, 'tool.completed', 'prepare_upload', '附件准备完成'),
+        localUploadEvent(localUploadRunId, 3, 'tool.started', 'upload_files', `正在上传 ${submittedFiles.length} 个附件 · 0%`),
+      ]
       const form = new FormData()
       form.append('question', submittedQuestion)
       form.append('response_mode', submittedMode)
@@ -872,6 +1104,16 @@ async function submitRun() {
       response = await apiPostForm<RunCreateResult>(
         `/api/conversations/${selectedConversationId.value}/runs/files`,
         form,
+        {},
+        (percent, stage) => {
+          updateLocalUploadStage(
+            localUploadRunId,
+            submittedFiles.length,
+            totalUploadBytes,
+            percent,
+            stage,
+          )
+        },
       )
     } else {
       response = await apiPost<RunCreateResult>(
@@ -907,7 +1149,7 @@ async function submitRun() {
     }
     activeRun.value = pendingRun
     runs.value = [pendingRun, ...runs.value]
-    resetTypewriter()
+    if (!localUploadRunId) resetTypewriter()
     // 先乐观显示用户消息，后台持久化版本会在下次刷新会话时替换它。
     messages.value.push({
       id: crypto.randomUUID(),
@@ -917,14 +1159,24 @@ async function submitRun() {
       extra: { run_id: response.run_id },
     })
     events.value = []
+    pendingUploadFiles.value = []
     toolRequests.value = []
     approvalError.value = ''
-    question.value = ''
-    clearTable()
+    if (!localUploadRunId) {
+      question.value = ''
+      clearTable()
+    }
     connectEvents(response.run_id)
     await scrollMessagesToBottom(true)
   } catch (error) {
-    submitError.value = error instanceof Error ? error.message : '提交失败，请稍后重试。'
+    const detail = error instanceof Error ? error.message : '提交失败，请稍后重试。'
+    if (localUploadRunId && activeRun.value?.id === localUploadRunId) {
+      activeRun.value.status = 'failed'
+      activeRun.value.error = detail
+      retryError.value = ''
+    } else {
+      submitError.value = detail
+    }
   } finally {
     isSubmitting.value = false
   }
@@ -1118,6 +1370,28 @@ async function retryRun(sourceRun: RunSummary | null = activeRun.value) {
   } finally {
     isRetrying.value = false
   }
+}
+
+async function retryFailedRun() {
+  const run = activeRun.value
+  if (!isLocalUploadRun(run)) {
+    await retryRun(run)
+    return
+  }
+  if (!run || !pendingUploadFiles.value.length) {
+    retryError.value = '原始附件已不可用，请重新选择文件后发送。'
+    return
+  }
+  question.value = run.question
+  attachments.value = [...pendingUploadFiles.value]
+  selectedAgent.value = run.agent_key || ''
+  responseMode.value = runResponseMode(run)
+  activeRunId.value = ''
+  activeRun.value = null
+  events.value = []
+  retryError.value = ''
+  await nextTick()
+  await submitRun()
 }
 function connectEvents(runId: string) {
   // 一个页面只保留一个活动连接，避免重复订阅和事件重复渲染。
@@ -1650,11 +1924,34 @@ async function apiPostForm<T>(
   url: string,
   payload: FormData,
   headers: Record<string, string> = {},
+  onProgress?: (percent: number, stage: Exclude<UploadStage, 'idle'>) => void,
 ): Promise<T> {
-  // 不手动设置 Content-Type，由浏览器自动附加 multipart boundary。
-  const response = await fetch(url, { method: 'POST', headers, body: payload })
-  if (!response.ok) throw new Error(await response.text())
-  return response.json() as Promise<T>
+  // Fetch 没有上传进度事件；附件请求使用 XHR，并继续由浏览器生成 multipart boundary。
+  return new Promise<T>((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    request.open('POST', url)
+    request.responseType = 'json'
+    for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value)
+    request.upload.addEventListener('progress', (event) => {
+      if (!event.lengthComputable || event.total <= 0) return
+      const percent = Math.min(99, Math.round(event.loaded / event.total * 100))
+      onProgress?.(percent, 'uploading')
+    })
+    request.upload.addEventListener('load', () => onProgress?.(100, 'processing'))
+    request.addEventListener('load', () => {
+      if (request.status >= 200 && request.status < 300) {
+        resolve(request.response as T)
+        return
+      }
+      const detail = typeof request.response === 'string'
+        ? request.response
+        : JSON.stringify(request.response || {})
+      reject(new Error(detail || `上传失败（HTTP ${request.status}）`))
+    })
+    request.addEventListener('error', () => reject(new Error('附件上传失败，请检查网络后重试。')))
+    request.addEventListener('abort', () => reject(new Error('附件上传已取消。')))
+    request.send(payload)
+  })
 }
 
 async function apiDelete(url: string): Promise<void> {
@@ -1978,11 +2275,18 @@ function processStageDefinition(stage: string) {
     replan: { id: 'replan', title: '调整执行计划', detail: '正在根据执行结果修复后续计划' },
     think: { id: 'reason', title: '规划下一步操作', detail: '正在判断是否需要使用工具' },
     direct_chat: { id: 'answer', title: '组织最终答复', detail: '正在生成回复内容' },
+    prepare_upload: { id: 'upload-prepare', title: '准备附件', detail: '正在创建任务上下文并整理待上传文件' },
+    upload_files: { id: 'upload', title: '上传附件', detail: '正在将附件安全传输到服务端' },
     parse_input: { id: 'parse', title: '读取考勤数据', detail: '正在解析输入表格' },
     parse_excel: { id: 'parse', title: '读取考勤数据', detail: '正在解析 Excel 文件' },
+    detect_excel_source: { id: 'attendance-source', title: '识别考勤数据源', detail: '正在根据文件表头识别考勤机和企业微信数据' },
+    parse_machine: { id: 'attendance-machine', title: '解析考勤机记录', detail: '正在读取考勤机原始打卡事件' },
+    parse_wecom: { id: 'attendance-wecom', title: '解析企业微信记录', detail: '正在读取企业微信上下班打卡日报' },
     normalize_data: { id: 'normalize', title: '整理考勤字段', detail: '正在统一字段和数据格式' },
     normalize_attendance: { id: 'normalize', title: '整理考勤字段', detail: '正在统一字段和数据格式' },
-    analyze_attendance: { id: 'analyze', title: '计算考勤结果', detail: '正在统计出勤、迟到、缺卡和扣款' },
+    merge_attendance_fact: { id: 'attendance-merge', title: '匹配双源打卡事件', detail: '正在核验考勤机与企业微信记录' },
+    analyze_attendance: { id: 'analyze', title: '汇总员工考勤', detail: '正在统计出勤、迟到、早退、缺卡和请假记录' },
+    generate_conclusion_excel: { id: 'attendance-export', title: '生成考勤结果表', detail: '正在生成并校验完整员工考勤汇总' },
     parse_attachments: { id: 'documents', title: '读取上传附件', detail: '正在安全解析文件内容' },
     analyze_document: { id: 'document-analysis', title: '分析文档内容', detail: '正在分段提取重点和事实' },
     generate_document_answer: { id: 'answer', title: '整理文档结论', detail: '正在根据附件生成最终答复' },
@@ -2045,7 +2349,12 @@ function eventStage(event: RunEvent): string {
     analyze_task: '分析任务',
     think: '规划下一步',
     parse_excel: '解析 Excel',
+    detect_excel_source: '识别考勤数据源',
+    parse_machine: '解析考勤机记录',
+    parse_wecom: '解析企业微信记录',
     normalize_attendance: '整理考勤字段',
+    merge_attendance_fact: '匹配双源打卡事件',
+    generate_conclusion_excel: '生成考勤结果表',
     generate_answer: '生成分析结论',
     persist_result: '保存执行结果',
     parse_input: '解析考勤数据',
@@ -2126,7 +2435,7 @@ function formatTime(value: string): string {
         >‹</button>
       </div>
 
-      <button class="new-chat" type="button" @click="createConversation">
+      <button class="new-chat" type="button" :disabled="isSubmitting" @click="createConversation">
         <span>＋</span>
         新建会话
       </button>
@@ -2140,13 +2449,14 @@ function formatTime(value: string): string {
             class="session-item"
             :class="{ active: conversation.id === selectedConversationId }"
           >
-            <button class="session-open" type="button" @click="selectConversation(conversation.id)">
+            <button class="session-open" type="button" :disabled="isSubmitting" @click="selectConversation(conversation.id)">
               <span>{{ conversation.title }}</span>
               <small>{{ formatTime(conversation.updated_at) }}</small>
             </button>
             <button
               class="session-delete"
               type="button"
+              :disabled="isSubmitting"
               :aria-label="`删除会话：${conversation.title}`"
               title="删除会话"
               @click.stop="deleteConversation(conversation)"
@@ -2526,28 +2836,72 @@ function formatTime(value: string): string {
                 <div><span>迟到</span><strong>{{ summary.total_late_count }} 次</strong></div>
                 <div><span>扣款</span><strong>{{ summary.total_deduction }} 元</strong></div>
               </div>
-              <div v-if="visibleEmployees.length" class="result-table-wrap">
+              <div v-if="focusEmployees.length" class="result-table-wrap">
+                <div class="result-table-heading">
+                  <strong>重点关注人员</strong>
+                  <span>共 {{ focusEmployees.length }} 人</span>
+                </div>
                 <table class="result-table">
                   <thead>
                     <tr>
                       <th>姓名</th>
-                      <th>出勤</th>
-                      <th>迟到</th>
-                      <th>缺卡</th>
-                      <th>扣款</th>
+                      <th v-for="metric in exceptionMetrics" :key="metric.type">{{ metric.label }}</th>
+                      <th>关注原因</th>
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="row in visibleEmployees" :key="String(row.name)">
+                    <tr v-for="row in focusEmployees" :key="row.employee_key || row.name">
                       <td>{{ row.name }}</td>
-                      <td>{{ row.attendance_days }}</td>
-                      <td>{{ row.late_count }}</td>
-                      <td>{{ row.missing_punch_count }}</td>
-                      <td>{{ row.deduction }}</td>
+                      <td v-for="metric in exceptionMetrics" :key="metric.type">
+                        <span v-if="!Number(row[metric.countKey] || 0)">0</span>
+                        <button
+                          v-else
+                          class="exception-tip-trigger"
+                          type="button"
+                          :class="{ active: activeExceptionTip?.key === `${row.employee_key || row.name}:${metric.type}` }"
+                          :aria-expanded="activeExceptionTip?.key === `${row.employee_key || row.name}:${metric.type}`"
+                          :aria-label="`查看${row.name}${metric.label}详情`"
+                          :title="`查看${metric.label}详情`"
+                          @click="toggleExceptionTip($event, row, metric)"
+                        >
+                          <span>{{ row[metric.countKey] }}</span><i aria-hidden="true">i</i>
+                        </button>
+                      </td>
+                      <td>{{ employeeAttentionText(row) }}</td>
                     </tr>
                   </tbody>
                 </table>
               </div>
+
+              <Teleport to="body">
+                <div
+                  v-if="activeExceptionTip"
+                  ref="exceptionTipPanel"
+                  class="exception-tip-panel exception-tip-floating"
+                  :style="{ top: `${activeExceptionTip.top}px`, left: `${activeExceptionTip.left}px` }"
+                  role="dialog"
+                  :aria-label="`${activeExceptionTip.row.name}${activeExceptionTip.metric.label}详情`"
+                  @pointerdown.stop
+                >
+                  <header><strong>{{ activeExceptionTip.row.name }} · {{ activeExceptionTip.metric.label }}详情</strong></header>
+                  <template v-if="activeExceptionDetails.length">
+                    <article
+                      v-for="(detail, detailIndex) in activeExceptionDetails"
+                      :key="`${detail.date}-${detailIndex}`"
+                    >
+                      <strong>{{ detail.date }}</strong>
+                      <ul v-if="detail.events.length">
+                        <li v-for="(event, eventIndex) in detail.events" :key="eventIndex">
+                          {{ event.punch_type }}：应打卡 {{ event.expected_time || '—' }}，实际 {{ event.actual_time || '未打卡' }}，状态“{{ event.status || '异常' }}”
+                        </li>
+                      </ul>
+                      <p>考勤机：{{ detail.machine_punches.length ? detail.machine_punches.join('、') : '无有效打卡' }}</p>
+                      <p>判定：{{ detail.reason || '—' }}</p>
+                    </article>
+                  </template>
+                  <p v-else class="exception-tip-empty">旧会话未保存异常明细，请重新分析附件。</p>
+                </div>
+              </Teleport>
 
               <div
                 v-if="typedAnswer || isTyping"
@@ -2617,8 +2971,8 @@ function formatTime(value: string): string {
                 <p>{{ failureDetail }}</p>
                 <div class="run-error-actions">
                   <span v-if="retryError">{{ retryError }}</span>
-                  <button type="button" :disabled="isRetrying" @click="retryRun()">
-                    {{ isRetrying ? '正在重新执行…' : '重新执行' }}
+                  <button type="button" :disabled="isRetrying || isSubmitting" @click="retryFailedRun">
+                    {{ isSubmitting ? '正在重新发送…' : isRetrying ? '正在重新执行…' : isLocalUploadRun(activeRun) ? '重新发送' : '重新执行' }}
                   </button>
                 </div>
               </div>
@@ -2661,7 +3015,7 @@ function formatTime(value: string): string {
         @dragleave.prevent="isDragging = false"
         @drop.prevent="onDrop"
       >
-        <div class="response-mode-bar">
+        <!-- <div class="response-mode-bar">
           <div
             class="response-mode-picker"
             :class="{ 'is-expert': responseMode === 'expert' }"
@@ -2686,7 +3040,7 @@ function formatTime(value: string): string {
               @click="selectResponseMode('expert')"
             ><span aria-hidden="true">✦</span>专家模式</button>
           </div>
-        </div>
+        </div> -->
         <div class="composer" :class="{ dragging: isDragging }">
           <section v-if="hasTable" class="composer-attachments" aria-label="已添加的附件">
             <div class="attachment-grid">
@@ -2696,8 +3050,11 @@ function formatTime(value: string): string {
                 class="attachment-card"
               >
                 <span class="file-glyph" :data-kind="attachmentType(file)" aria-hidden="true">{{ attachmentType(file).slice(0, 1) }}</span>
-                <div><strong>{{ file.name }}</strong><small>{{ attachmentType(file) }} · {{ formatFileSize(file.size) }} · 已就绪</small></div>
-                <button type="button" aria-label="移除附件" title="移除附件" @click="removeAttachment(index)">×</button>
+                <div>
+                  <strong>{{ file.name }}</strong>
+                  <small>{{ attachmentType(file) }} · {{ formatFileSize(file.size) }} · 已就绪</small>
+                </div>
+                <button type="button" aria-label="移除附件" title="移除附件" :disabled="isSubmitting" @click="removeAttachment(index)">×</button>
               </article>
               <article v-if="hasClipboardTable" class="attachment-card">
                 <span class="file-glyph" data-kind="Excel" aria-hidden="true">X</span>
@@ -2706,8 +3063,8 @@ function formatTime(value: string): string {
               </article>
             </div>
             <div class="attachment-prompts">
-              <button type="button" @click="applyAttachmentPrompt('梳理附件的重点内容，并给出结构化总结')">梳理重点内容 <span>→</span></button>
-              <button type="button" @click="applyAttachmentPrompt('分析附件，找出关键结论、异常和需要关注的问题')">分析并找出问题 <span>→</span></button>
+              <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('梳理附件的重点内容，并给出结构化总结')">梳理重点内容 <span>→</span></button>
+              <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('分析附件，找出关键结论、异常和需要关注的问题')">分析并找出问题 <span>→</span></button>
             </div>
           </section>
           <textarea
@@ -2724,12 +3081,14 @@ function formatTime(value: string): string {
                 type="file"
                 accept=".xlsx,.xlsm,.csv,.pdf,.docx,.pptx,.txt,.md"
                 multiple
+                :disabled="isSubmitting"
                 @change="onFileChange"
               />
               <button
                 class="attach-button"
                 type="button"
                 title="添加附件"
+                :disabled="isSubmitting"
                 @click="openFilePicker"
               >
                 <span aria-hidden="true">＋</span>

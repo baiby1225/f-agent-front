@@ -1180,9 +1180,12 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .metric-grid strong { display: block; margin-top: 5px; font-size: 16px; }
 .result-table-wrap { overflow-x: auto; }
+.result-table-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; }
+.result-table-heading strong { font-size: 13px; }
+.result-table-heading span { color: var(--muted); font-size: 12px; }
 .result-table {
   width: 100%;
-  margin-top: 16px;
+  margin-top: 8px;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -1190,8 +1193,57 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   padding: 10px 8px;
   border-bottom: 1px solid var(--line);
   text-align: left;
+  vertical-align: top;
 }
 .result-table th { color: var(--muted); font-weight: 600; }
+.exception-tip-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--blue-deep);
+  background: #eef3ff;
+  font-weight: 700;
+  cursor: pointer;
+}
+.exception-tip-trigger:hover,
+.exception-tip-trigger.active { background: #dfe7ff; }
+.exception-tip-trigger i {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  border: 1px solid #9aacf1;
+  border-radius: 50%;
+  font: 700 9px/1 Arial, sans-serif;
+}
+.exception-tip-panel {
+  width: min(430px, 72vw);
+  max-height: 320px;
+  padding: 10px 11px;
+  overflow-y: auto;
+  border: 1px solid #d8e1ff;
+  border-radius: 10px;
+  color: #3c4657;
+  background: #f8faff;
+  box-shadow: 0 10px 28px rgba(31,42,68,.10);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.exception-tip-floating {
+  position: fixed;
+  z-index: 1000;
+  width: min(430px, calc(100vw - 24px));
+}
+.exception-tip-panel > header { margin-bottom: 7px; color: #273247; }
+.exception-tip-panel article + article { margin-top: 9px; padding-top: 9px; border-top: 1px dashed #d8deea; }
+.exception-tip-panel article > strong { color: var(--blue-deep); }
+.exception-tip-panel ul { margin: 5px 0; padding-left: 18px; }
+.exception-tip-panel li { margin: 2px 0; }
+.exception-tip-panel p { margin: 4px 0 0; }
+.exception-tip-empty { color: var(--muted); }
 
 .composer-wrap {
   padding: 0 clamp(18px, 7vw, 86px) 24px;
@@ -1285,6 +1337,9 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   font-size: 18px;
 }
 .attachment-card > button:hover { color: #b42318; background: #fff; }
+.attachment-card > button:disabled,
+.attachment-prompts button:disabled,
+.attach-button:disabled { cursor: not-allowed; opacity: .45; }
 .attachment-prompts { display: flex; gap: 8px; flex-wrap: wrap; }
 .attachment-prompts button {
   height: 32px;
@@ -1313,15 +1368,19 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   flex-wrap: wrap;
 }
 .attach-button {
+  width: 34px;
   height: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid var(--line);
-  border-radius: 999px;
+  border-radius: 50%;
   background: #f8faff;
   color: var(--ink);
   font-size: 13px;
-  padding: 0 13px 0 9px;
 }
-.attach-button span { margin-right: 5px; color: var(--blue); font-size: 19px; vertical-align: -1px; }
+.attach-button span { color: var(--blue); font-size: 19px; }
 .attach-button:hover { border-color: #c8d3f6; color: var(--blue-deep); background: #f2f5ff; }
 .agent-picker {
   display: flex;
