@@ -358,6 +358,7 @@ const activeAgent = computed(() => agents.value.find(
 ))
 const hasClipboardTable = computed(() => Boolean(tableText.value.trim() || tableHtml.value.trim()))
 const hasTable = computed(() => hasClipboardTable.value || attachments.value.length > 0)
+const hasAttendanceData = computed(() => attachments.value.some((f) => f.name.includes('考勤')||f.name.includes('打卡记录')))
 const pasteRowCount = computed(() => tableText.value.split(/\r?\n/).filter((line) => line.trim()).length)
 const isRunActive = computed(() => ['pending', 'running', 'waiting_approval'].includes(
   activeRun.value?.status || '',
@@ -1044,7 +1045,7 @@ async function submitRun() {
   const submittedQuestion = question.value.trim()
   const submittedFiles = [...attachments.value]
   const requestedAgent = selectedAgent.value
-  const submittedMode = responseMode.value
+  const submittedMode =responseMode.value
   const totalUploadBytes = submittedFiles.reduce((total, file) => total + file.size, 0)
   let localUploadRunId = ''
   try {
@@ -3015,33 +3016,33 @@ function formatTime(value: string): string {
         @dragleave.prevent="isDragging = false"
         @drop.prevent="onDrop"
       >
-        <!-- <div class="response-mode-bar">
-          <div
-            class="response-mode-picker"
-            :class="{ 'is-expert': responseMode === 'expert' }"
-            role="group"
-            aria-label="回答模式"
-          >
-            <span class="response-mode-slider" aria-hidden="true"></span>
-            <button
-              type="button"
-              :class="{ active: responseMode === 'fast' }"
-              :aria-pressed="responseMode === 'fast'"
-              :disabled="isResponseActive || isSubmitting"
-              title="优先响应，适合日常问答和简单工具任务"
-              @click="selectResponseMode('fast')"
-            ><span aria-hidden="true">⚡</span>快速模式</button>
-            <button
-              type="button"
-              :class="{ active: responseMode === 'expert' }"
-              :aria-pressed="responseMode === 'expert'"
-              :disabled="isResponseActive || isSubmitting"
-              title="先规划再执行，适合复杂和高准确度任务"
-              @click="selectResponseMode('expert')"
-            ><span aria-hidden="true">✦</span>专家模式</button>
+        <div class="composer" :class="{ dragging: isDragging, ['mode-' + responseMode]: true }">
+          <div class="response-mode-bar">
+            <div
+              class="response-mode-picker"
+              :class="{ 'is-expert': responseMode === 'expert' }"
+              role="group"
+              aria-label="回答模式"
+            >
+              <span class="response-mode-slider" aria-hidden="true"></span>
+              <button
+                type="button"
+                :class="{ active: responseMode === 'fast' }"
+                :aria-pressed="responseMode === 'fast'"
+                :disabled="isResponseActive || isSubmitting"
+                title="优先响应，适合日常问答和简单工具任务"
+                @click="selectResponseMode('fast')"
+              ><span aria-hidden="true">⚡</span>快速模式</button>
+              <button
+                type="button"
+                :class="{ active: responseMode === 'expert' }"
+                :aria-pressed="responseMode === 'expert'"
+                :disabled="isResponseActive || isSubmitting"
+                title="先规划再执行，适合复杂和高准确度任务"
+                @click="selectResponseMode('expert')"
+              ><span aria-hidden="true">✦</span>专家模式</button>
+            </div>
           </div>
-        </div> -->
-        <div class="composer" :class="{ dragging: isDragging }">
           <section v-if="hasTable" class="composer-attachments" aria-label="已添加的附件">
             <div class="attachment-grid">
               <article
@@ -3063,8 +3064,15 @@ function formatTime(value: string): string {
               </article>
             </div>
             <div class="attachment-prompts">
-              <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('梳理附件的重点内容，并给出结构化总结')">梳理重点内容 <span>→</span></button>
-              <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('分析附件，找出关键结论、异常和需要关注的问题')">分析并找出问题 <span>→</span></button>
+              <template v-if="hasAttendanceData">
+                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('分析考勤数据，统计迟到、早退、缺卡情况')">统计考勤异常 <span>→</span></button>
+                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('核对打卡记录差异，标注异常员工')">核对打卡差异 <span>→</span></button>
+                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('汇总出勤情况并生成考勤异常报告')">生成考勤报告 <span>→</span></button>
+              </template>
+              <template v-else>
+                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('梳理附件的重点内容，并给出结构化总结')">梳理重点内容 <span>→</span></button>
+                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('分析附件，找出关键结论、异常和需要关注的问题')">分析并找出问题 <span>→</span></button>
+              </template>
             </div>
           </section>
           <textarea

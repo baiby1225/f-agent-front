@@ -1249,21 +1249,46 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   padding: 0 clamp(18px, 7vw, 86px) 24px;
 }
 .response-mode-bar {
-  display: flex;
-  justify-content: center;
-  max-width: 860px;
-  margin: 0 auto 10px;
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%) translateY(-50%);
+  z-index: 2;
 }
 .composer {
+  position: relative;
   max-width: 860px;
   margin: 0 auto;
   padding: 14px;
+  padding-top: 32px;
   border: 1px solid #dbe2f2;
   border-radius: 24px;
   background: rgba(255,255,255,.94);
+  --composer-bg: rgba(255,255,255,.94);
   box-shadow: 0 18px 60px rgba(31,42,68,.13);
+  overflow: visible;
+  transition: border-color .3s ease, background .3s ease, box-shadow .3s ease;
 }
+.composer::before {
+  content: '';
+  position: absolute;
+  top: 11px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 220px;
+  height: 22px;
+  background: var(--composer-bg);
+  border-radius: 11px;
+  z-index: 1;
+  pointer-events: none;
+  transition: background .3s ease;
+}
+.composer.mode-fast { border-color: #34c759; }
+.composer.mode-expert { border-color: #f5a623; }
+.composer.dragging.mode-fast { --composer-bg: #f3f6ff; border-color: #28a745; box-shadow: 0 0 0 5px rgba(52,199,89,.12), 0 18px 60px rgba(31,42,68,.13); }
+.composer.dragging.mode-expert { --composer-bg: #f3f6ff; border-color: #e09100; box-shadow: 0 0 0 5px rgba(245,166,35,.12), 0 18px 60px rgba(31,42,68,.13); }
 .composer.dragging {
+  --composer-bg: #f3f6ff;
   border-color: var(--blue);
   background: #f3f6ff;
   box-shadow: 0 0 0 5px rgba(74,108,247,.10), 0 18px 60px rgba(31,42,68,.13);
@@ -1421,14 +1446,18 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   left: 0;
   width: 50%;
   border-radius: 999px;
-  background: var(--blue);
-  box-shadow: 0 2px 7px rgba(49,81,212,.22);
+  background: #34c759;
+  box-shadow: 0 2px 7px rgba(52,199,89,.25);
   pointer-events: none;
   transform: translate3d(0,0,0);
   will-change: transform;
-  transition: transform .24s cubic-bezier(.2,.8,.2,1);
+  transition: transform .24s cubic-bezier(.2,.8,.2,1), background .3s ease, box-shadow .3s ease;
 }
-.response-mode-picker.is-expert .response-mode-slider { transform: translate3d(100%,0,0); }
+.response-mode-picker.is-expert .response-mode-slider {
+  transform: translate3d(100%,0,0);
+  background: #f5a623;
+  box-shadow: 0 2px 7px rgba(245,166,35,.25);
+}
 .response-mode-picker button {
   position: relative;
   z-index: 1;
@@ -1501,10 +1530,10 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   .approval-actions > span { flex-basis: 100%; }
   .step-strip > div { grid-template-columns: 8px minmax(82px, auto) minmax(0, 1fr); }
   .composer-wrap { padding: 0 12px 14px; }
-  .response-mode-bar { margin-bottom: 8px; }
   .response-mode-picker { width: min(240px, calc(100vw - 48px)); }
   .response-mode-picker button { min-width: 0; flex: 1; padding: 0 8px; }
   .composer { border-radius: 18px; }
+  .composer::before { width: 190px; }
 }
 
 @media (max-width: 1180px) {
