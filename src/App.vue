@@ -57,6 +57,9 @@ type RunSummary = {
   retry_of_run_id?: string | null
   attachments?: AttachmentSummary[]
   artifacts?: RunArtifact[]
+  prompt_tokens?: number | null
+  completion_tokens?: number | null
+  total_tokens?: number | null
 }
 
 type ConversationTurn = {
@@ -196,6 +199,7 @@ type ProcessStep = {
   occurredAt: string
   status: 'done' | 'active' | 'failed'
   meta?: string
+  tokens?: number | null
 }
 
 type UploadStage = 'uploading' | 'processing'
@@ -304,7 +308,7 @@ const conversationGroups = computed<ConversationGroup[]>(() => {
 
   const sorted = [...conversations.value].sort((left, right) => (
     parseServerTime(right.updated_at || right.created_at)
-      - parseServerTime(left.updated_at || left.created_at)
+    - parseServerTime(left.updated_at || left.created_at)
   ))
   for (const conversation of sorted) {
     const timestamp = parseServerTime(conversation.updated_at || conversation.created_at)
@@ -346,6 +350,15 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
 
 // 派生状态集中定义，模板只负责展示，不重复业务判断。
 const routedAgentKey = computed(() => {
+  // 优先使用 route_complete 事件（轻量路由判断后发送）
+  const routeCompleteEvent = [...events.value].reverse().find((event) => (
+    String(event.payload.stage || '') === 'route_complete'
+  ))
+  if (routeCompleteEvent?.payload.active_agent) {
+    const target = String(routeCompleteEvent.payload.active_agent)
+    return agents.value.find((agent) => agent.key === target)?.key || target
+  }
+  // 回退到 dispatch_agent 事件（完整意图识别后发送）
   const dispatchEvent = [...events.value].reverse().find((event) => (
     String(event.payload.stage || '') === 'dispatch_agent'
   ))
@@ -358,7 +371,7 @@ const activeAgent = computed(() => agents.value.find(
 ))
 const hasClipboardTable = computed(() => Boolean(tableText.value.trim() || tableHtml.value.trim()))
 const hasTable = computed(() => hasClipboardTable.value || attachments.value.length > 0)
-const hasAttendanceData = computed(() => attachments.value.some((f) => f.name.includes('考勤')||f.name.includes('打卡记录')))
+const hasAttendanceData = computed(() => attachments.value.some((f) => f.name.includes('考勤') || f.name.includes('打卡记录')))
 const pasteRowCount = computed(() => tableText.value.split(/\r?\n/).filter((line) => line.trim()).length)
 const isRunActive = computed(() => ['pending', 'running', 'waiting_approval'].includes(
   activeRun.value?.status || '',
@@ -451,6 +464,9 @@ const conversationTurns = computed<ConversationTurn[]>(() => {
     })
   }
   return turns.sort((left, right) => runTimestamp(left.attempts[0]) - runTimestamp(right.attempts[0]))
+})
+const conversationTotalTokens = computed(() => {
+  return runs.value.reduce((sum, run) => sum + (run.total_tokens || 0), 0)
 })
 const historicalTurns = computed(() => conversationTurns.value.filter(
   (turn) => !turn.attempts.some((attempt) => attempt.id === activeRunId.value),
@@ -1045,7 +1061,7 @@ async function submitRun() {
   const submittedQuestion = question.value.trim()
   const submittedFiles = [...attachments.value]
   const requestedAgent = selectedAgent.value
-  const submittedMode =responseMode.value
+  const submittedMode = responseMode.value
   const totalUploadBytes = submittedFiles.reduce((total, file) => total + file.size, 0)
   let localUploadRunId = ''
   try {
@@ -1833,6 +1849,12 @@ function formatElapsed(milliseconds: number): string {
   return `${minutes} 分 ${seconds} 秒`
 }
 
+function formatTokens(tokens: number | null | undefined): string {
+  if (!tokens) return ''
+  if (tokens >= 10000) return `${(tokens / 1000).toFixed(1)}k`
+  return String(tokens)
+}
+
 function processStepElapsed(step: ProcessStep): string {
   const startedAt = parseServerTime(step.occurredAt)
   return formatElapsed(Math.max(0, clockNow.value - startedAt))
@@ -2173,6 +2195,39 @@ function buildProcessSteps(source: RunEvent[], runStatus: string): ProcessStep[]
       }
       continue
     }
+    if (event.type === 'step.started') {
+      const stepKey = String(event.payload.step_key || '')
+      const stepTitle = String(event.payload.title || stepKey)
+      const definition = processStageDefinition(stepKey)
+      activate({
+        id: `step-${stepKey}`,
+        title: definition?.title || stepTitle,
+        detail: definition?.detail || '正在处理',
+        occurredAt,
+        status: 'active',
+      })
+      continue
+    }
+    if (event.type === 'step.completed') {
+      const stepKey = String(event.payload.step_key || '')
+      const step = steps.find((item) => item.id === `step-${stepKey}`)
+      if (step) {
+        step.status = event.payload.status === 'failed' ? 'failed' : 'done'
+        step.detail = `${step.title}完成`
+        const stepTokens = Number(event.payload.total_tokens)
+        if (stepTokens > 0) step.tokens = stepTokens
+      }
+      continue
+    }
+    if (event.type === 'step.failed') {
+      const stepKey = String(event.payload.step_key || '')
+      const step = steps.find((item) => item.id === `step-${stepKey}`)
+      if (step) {
+        step.status = 'failed'
+        step.detail = '执行失败'
+      }
+      continue
+    }
     const definition = processStageDefinition(stage)
     if (event.type === 'tool.started' && definition && !event.payload.tool) {
       activate({
@@ -2280,6 +2335,9 @@ function processStageDefinition(stage: string) {
     upload_files: { id: 'upload', title: '上传附件', detail: '正在将附件安全传输到服务端' },
     parse_input: { id: 'parse', title: '读取考勤数据', detail: '正在解析输入表格' },
     parse_excel: { id: 'parse', title: '读取考勤数据', detail: '正在解析 Excel 文件' },
+    validate_input: { id: 'attendance-validate', title: '校验输入', detail: '正在检查考勤数据格式和完整性' },
+    resolve_turn_context: { id: 'attendance-context', title: '理解需求', detail: '正在加载历史考勤快照和会话上下文' },
+    request_table: { id: 'attendance-request', title: '请求表格', detail: '正在引导用户上传考勤 Excel' },
     detect_excel_source: { id: 'attendance-source', title: '识别考勤数据源', detail: '正在根据文件表头识别考勤机和企业微信数据' },
     parse_machine: { id: 'attendance-machine', title: '解析考勤机记录', detail: '正在读取考勤机原始打卡事件' },
     parse_wecom: { id: 'attendance-wecom', title: '解析企业微信记录', detail: '正在读取企业微信上下班打卡日报' },
@@ -2287,12 +2345,14 @@ function processStageDefinition(stage: string) {
     normalize_attendance: { id: 'normalize', title: '整理考勤字段', detail: '正在统一字段和数据格式' },
     merge_attendance_fact: { id: 'attendance-merge', title: '匹配双源打卡事件', detail: '正在核验考勤机与企业微信记录' },
     analyze_attendance: { id: 'analyze', title: '汇总员工考勤', detail: '正在统计出勤、迟到、早退、缺卡和请假记录' },
+    persist_snapshot: { id: 'attendance-snapshot', title: '保存考勤快照', detail: '正在将分析结果持久化到数据库' },
     generate_conclusion_excel: { id: 'attendance-export', title: '生成考勤结果表', detail: '正在生成并校验完整员工考勤汇总' },
+    generate_answer: { id: 'answer', title: '整理分析结论', detail: '正在生成清晰的结果说明' },
+    answer_follow_up: { id: 'attendance-followup', title: '追问作答', detail: '正在查询考勤数据并回答追问' },
     parse_attachments: { id: 'documents', title: '读取上传附件', detail: '正在安全解析文件内容' },
     analyze_document: { id: 'document-analysis', title: '分析文档内容', detail: '正在分段提取重点和事实' },
     generate_document_answer: { id: 'answer', title: '整理文档结论', detail: '正在根据附件生成最终答复' },
     build_answer: { id: 'answer', title: '整理分析结论', detail: '正在生成清晰的结果说明' },
-    generate_answer: { id: 'answer', title: '整理分析结论', detail: '正在生成清晰的结果说明' },
     persist_result: { id: 'save', title: '保存执行结果', detail: '正在保存结果和执行记录' },
     final: { id: 'answer', title: '生成最终答复', detail: '正在组织回复内容' },
   }
@@ -2341,6 +2401,21 @@ function eventStage(event: RunEvent): string {
   if (event.type === 'tool.started') return '调用工具'
   if (event.type === 'tool.completed') {
     return event.payload.ok === false ? '工具调用失败' : '工具调用完成'
+  }
+  if (event.type === 'step.started') {
+    const stepKey = String(event.payload.step_key || '')
+    const definition = processStageDefinition(stepKey)
+    return definition?.title || String(event.payload.title || '步骤开始')
+  }
+  if (event.type === 'step.completed') {
+    const stepKey = String(event.payload.step_key || '')
+    const definition = processStageDefinition(stepKey)
+    return `${definition?.title || String(event.payload.title || '步骤')}完成`
+  }
+  if (event.type === 'step.failed') {
+    const stepKey = String(event.payload.step_key || '')
+    const definition = processStageDefinition(stepKey)
+    return `${definition?.title || String(event.payload.title || '步骤')}失败`
   }
   const stage = String(event.payload.stage || event.type)
   const labels: Record<string, string> = {
@@ -2411,29 +2486,19 @@ function formatTime(value: string): string {
 </script>
 
 <template>
-  <main
-    class="shell"
-    :style="{ '--execution-width': executionCollapsed ? '0px' : executionWidth + 'px' }"
-    :class="{
-      'sessions-collapsed': sessionsCollapsed,
-      'execution-collapsed': executionCollapsed,
-      'execution-resizing': isExecutionResizing,
-    }"
-  >
+  <main class="shell" :style="{ '--execution-width': executionCollapsed ? '0px' : executionWidth + 'px' }" :class="{
+    'sessions-collapsed': sessionsCollapsed,
+    'execution-collapsed': executionCollapsed,
+    'execution-resizing': isExecutionResizing,
+  }">
     <aside v-if="!sessionsCollapsed" class="sessions" aria-label="会话列表">
       <div class="brand-row">
         <div class="brand-identity">
           <span class="brand-mark">F</span>
           <strong>Fuecn Agent</strong>
         </div>
-        <button
-          class="sidebar-collapse-button"
-          type="button"
-          aria-label="折叠会话列表"
-          title="折叠会话列表"
-          :aria-expanded="true"
-          @click="toggleSessions"
-        >‹</button>
+        <button class="sidebar-collapse-button" type="button" aria-label="折叠会话列表" title="折叠会话列表" :aria-expanded="true"
+          @click="toggleSessions">‹</button>
       </div>
 
       <button class="new-chat" type="button" :disabled="isSubmitting" @click="createConversation">
@@ -2444,24 +2509,15 @@ function formatTime(value: string): string {
       <nav class="session-list" aria-label="会话列表">
         <section v-for="group in conversationGroups" :key="group.key" class="session-group">
           <p>{{ group.label }}</p>
-          <div
-            v-for="conversation in group.items"
-            :key="conversation.id"
-            class="session-item"
-            :class="{ active: conversation.id === selectedConversationId }"
-          >
-            <button class="session-open" type="button" :disabled="isSubmitting" @click="selectConversation(conversation.id)">
-              <span>{{ conversation.title }}</span>
+          <div v-for="conversation in group.items" :key="conversation.id" class="session-item"
+            :class="{ active: conversation.id === selectedConversationId }">
+            <button class="session-open" type="button" :disabled="isSubmitting"
+              @click="selectConversation(conversation.id)">
+              <span :title="conversation.title">{{ conversation.title }}</span>
               <small>{{ formatTime(conversation.updated_at) }}</small>
             </button>
-            <button
-              class="session-delete"
-              type="button"
-              :disabled="isSubmitting"
-              :aria-label="`删除会话：${conversation.title}`"
-              title="删除会话"
-              @click.stop="deleteConversation(conversation)"
-            >
+            <button class="session-delete" type="button" :disabled="isSubmitting"
+              :aria-label="`删除会话：${conversation.title}`" title="删除会话" @click.stop="deleteConversation(conversation)">
               ×
             </button>
           </div>
@@ -2473,39 +2529,27 @@ function formatTime(value: string): string {
       <header class="chat-topbar">
         <div class="chat-topbar-left">
           <div v-if="sessionsCollapsed" class="sidebar-quick-controls">
-            <button
-              class="sidebar-restore-button"
-              type="button"
-              aria-label="展开会话列表"
-              title="展开会话列表"
-              :aria-expanded="false"
-              @click="toggleSessions"
-            >☰</button>
-            <button
-              class="sidebar-restore-button"
-              type="button"
-              aria-label="新建会话"
-              title="新建会话"
-              @click="createConversation"
-            >＋</button>
+            <button class="sidebar-restore-button" type="button" aria-label="展开会话列表" title="展开会话列表"
+              :aria-expanded="false" @click="toggleSessions">☰</button>
+            <button class="sidebar-restore-button" type="button" aria-label="新建会话" title="新建会话"
+              @click="createConversation">＋</button>
           </div>
           <div class="chat-title">
             <span class="crumb">当前会话</span>
-            <strong>{{ activeConversation?.title || '新的会话' }}</strong>
+            <strong>{{ activeConversation?.title || '新的会话' }}
+              <span v-if="conversationTotalTokens" class="crumb conversation-tokens">
+                {{ conversationTotalTokens.toLocaleString() }} tokens
+              </span>
+
+            </strong>
+
           </div>
         </div>
         <div class="chat-topbar-actions">
           <span class="run-state">{{ runStatusText }}</span>
-          <button
-            v-if="executionCollapsed"
-            class="sidebar-restore-button trace-restore-button"
-            :class="{ active: activeRun?.status === 'running' }"
-            type="button"
-            aria-label="展开执行轨迹"
-            title="展开执行轨迹"
-            :aria-expanded="false"
-            @click="toggleExecution"
-          >◎</button>
+          <button v-if="executionCollapsed" class="sidebar-restore-button trace-restore-button"
+            :class="{ active: activeRun?.status === 'running' }" type="button" aria-label="展开执行轨迹" title="展开执行轨迹"
+            :aria-expanded="false" @click="toggleExecution">◎</button>
         </div>
       </header>
 
@@ -2521,26 +2565,23 @@ function formatTime(value: string): string {
             <div class="avatar">我</div>
             <div class="bubble user-bubble" :tabindex="isTerminalRun(turn.latestRun) ? 0 : undefined">
               <div v-if="turnAttachments(turn).length" class="sent-attachment-grid">
-                <article
-                  v-for="(attachment, index) in turnAttachments(turn)"
-                  :key="`${turn.id}-${attachment.filename}-${index}`"
-                  class="attachment-card sent-attachment-card"
-                >
-                  <span class="file-glyph" :data-kind="attachmentTypeByExtension(attachment.extension)" aria-hidden="true">{{ attachmentTypeByExtension(attachment.extension).slice(0, 1) }}</span>
-                  <div><strong>{{ attachment.filename }}</strong><small>{{ attachmentTypeByExtension(attachment.extension) }} · {{ formatFileSize(attachment.file_size) }}</small></div>
+                <article v-for="(attachment, index) in turnAttachments(turn)"
+                  :key="`${turn.id}-${attachment.filename}-${index}`" class="attachment-card sent-attachment-card">
+                  <span class="file-glyph" :data-kind="attachmentTypeByExtension(attachment.extension)"
+                    aria-hidden="true">{{ attachmentTypeByExtension(attachment.extension).slice(0, 1) }}</span>
+                  <div><strong>{{ attachment.filename }}</strong><small>{{
+                    attachmentTypeByExtension(attachment.extension) }} · {{ formatFileSize(attachment.file_size)
+                      }}</small></div>
                 </article>
               </div>
               <div v-if="editingRunId === turn.latestRun.id" class="user-question-editor">
-                <textarea
-                  v-model="editingQuestion"
-                  rows="3"
-                  aria-label="编辑问题"
-                  @keydown="handleEditKeydown($event, turn.latestRun)"
-                ></textarea>
+                <textarea v-model="editingQuestion" rows="3" aria-label="编辑问题"
+                  @keydown="handleEditKeydown($event, turn.latestRun)"></textarea>
                 <span v-if="editError" class="question-edit-error">{{ editError }}</span>
                 <div class="question-edit-actions">
                   <button type="button" @click="cancelEditing">取消</button>
-                  <button type="button" :disabled="isRetrying || !editingQuestion.trim()" @click="submitEditedRun(turn.latestRun)">
+                  <button type="button" :disabled="isRetrying || !editingQuestion.trim()"
+                    @click="submitEditedRun(turn.latestRun)">
                     {{ isRetrying ? '发送中…' : '发送' }}
                   </button>
                 </div>
@@ -2548,14 +2589,9 @@ function formatTime(value: string): string {
               <template v-else>
                 <p>{{ turn.attempts[0]?.question || turn.latestRun.question }}</p>
                 <div v-if="isTerminalRun(turn.latestRun)" class="question-actions" aria-label="问题操作">
-                  <button
-                    class="question-action-button"
-                    :class="{ 'is-copied': copiedRunId === turn.latestRun.id }"
-                    type="button"
-                    :aria-label="copiedRunId === turn.latestRun.id ? '已复制' : '复制问题'"
-                    :title="copiedRunId === turn.latestRun.id ? '已复制' : '复制'"
-                    @click="copyRunQuestion(turn.latestRun)"
-                  >
+                  <button class="question-action-button" :class="{ 'is-copied': copiedRunId === turn.latestRun.id }"
+                    type="button" :aria-label="copiedRunId === turn.latestRun.id ? '已复制' : '复制问题'"
+                    :title="copiedRunId === turn.latestRun.id ? '已复制' : '复制'" @click="copyRunQuestion(turn.latestRun)">
                     <svg v-if="copiedRunId === turn.latestRun.id" viewBox="0 0 24 24" aria-hidden="true">
                       <path d="m5 12.5 4.2 4.2L19 7"></path>
                     </svg>
@@ -2564,13 +2600,8 @@ function formatTime(value: string): string {
                       <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path>
                     </svg>
                   </button>
-                  <button
-                    class="question-action-button"
-                    type="button"
-                    aria-label="编辑问题"
-                    title="编辑"
-                    @click="startEditing(turn.latestRun)"
-                  >
+                  <button class="question-action-button" type="button" aria-label="编辑问题" title="编辑"
+                    @click="startEditing(turn.latestRun)">
                     <svg viewBox="0 0 24 24" aria-hidden="true">
                       <path d="M13.5 6.5 17.5 10.5"></path>
                       <path d="M4 20h4l10.5-10.5a2.8 2.8 0 0 0-4-4L4 16v4Z"></path>
@@ -2584,94 +2615,97 @@ function formatTime(value: string): string {
             <div class="avatar agent-avatar">A</div>
             <div class="agent-response-column">
               <section class="agent-panel historical-agent-panel">
-              <header class="agent-message-header">
-                <div>
-                  <strong>{{ agentDisplayName(turn.latestRun.agent_key) }}</strong>
-                  <span :class="`status-${turn.latestRun.status}`">{{ runStatusLabel(turn.latestRun.status) }}</span>
-                </div>
-                <small>{{ formatTime(turn.latestRun.updated_at || turn.latestRun.created_at || '') }}</small>
-              </header>
+                <header class="agent-message-header">
+                  <div>
+                    <strong>{{ agentDisplayName(turn.latestRun.agent_key) }}</strong>
+                    <span :class="`status-${turn.latestRun.status}`">{{ runStatusLabel(turn.latestRun.status) }}</span>
+                    <span v-if="turn.latestRun.total_tokens" class="historical-tokens">{{
+                      turn.latestRun.total_tokens.toLocaleString() }} tokens</span>
+                  </div>
+                  <small>{{ formatTime(turn.latestRun.updated_at || turn.latestRun.created_at || '') }}</small>
+                </header>
 
-              <details v-if="runReasoning(turn.latestRun)" class="reasoning-panel historical-reasoning">
-                <summary>
-                  <span class="reasoning-orb" aria-hidden="true">✦</span>
-                  <strong>已深度思考<span v-if="runReasoningElapsed(turn.latestRun)"> {{ runReasoningElapsed(turn.latestRun) }}</span></strong>
-                  <small>查看思考过程</small>
-                </summary>
-                <div class="reasoning-content markdown-body" v-html="renderMarkdown(runReasoning(turn.latestRun))"></div>
-              </details>
+                <details v-if="runReasoning(turn.latestRun)" class="reasoning-panel historical-reasoning">
+                  <summary>
+                    <span class="reasoning-orb" aria-hidden="true">✦</span>
+                    <strong>已深度思考<span v-if="runReasoningElapsed(turn.latestRun)"> {{
+                      runReasoningElapsed(turn.latestRun)
+                        }}</span></strong>
+                    <small>查看思考过程</small>
+                  </summary>
+                  <div class="reasoning-content markdown-body" v-html="renderMarkdown(runReasoning(turn.latestRun))">
+                  </div>
+                </details>
 
-              <div
-                v-if="runAnswer(turn.latestRun)"
-                class="historical-answer markdown-body"
-                :class="{ 'without-reasoning': !runReasoning(turn.latestRun) }"
-                v-html="renderMarkdown(runAnswer(turn.latestRun))"
-                @click="handleCitationClick($event, turn.latestRun)"
-              ></div>
-              <div v-else-if="turn.latestRun.error" class="run-error compact-error">
-                <p>{{ turn.latestRun.error }}</p>
-              </div>
-              <div v-else-if="turn.latestRun.status === 'cancelled'" class="run-cancelled compact-cancelled">
-                <span>回答已停止</span>
-                <button type="button" :disabled="isRetrying || isResponseActive" @click="retryRun(turn.latestRun)">重新开始</button>
-              </div>
-              <button
-                v-if="runCitations(turn.latestRun).length"
-                class="citation-summary-chip"
-                type="button"
-                @click="openRunCitations(turn.latestRun)"
-              >
-                <span class="citation-summary-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1.1l2-2A5 5 0 0 0 12 4l-1.1 1.1M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1"></path></svg>
-                </span>
-                <span class="citation-site-stack" aria-hidden="true">
-                  <i v-for="citation in runCitations(turn.latestRun).slice(0, 3)" :key="citation.id">{{ sourceInitial(citation) }}</i>
-                </span>
-                <strong>{{ runCitations(turn.latestRun).length }} 个网页</strong>
-              </button>
-              <section v-if="runArtifacts(turn.latestRun).length" class="artifact-deliveries compact-artifacts">
-                <header><strong>生成文件</strong><span>{{ runArtifacts(turn.latestRun).length }} 个</span></header>
-                <div class="artifact-delivery-list">
-                  <article
-                    v-for="artifact in runArtifacts(turn.latestRun)"
-                    :key="artifact.id"
-                    class="artifact-delivery-card"
-                    :class="{ selected: selectedArtifact?.id === artifact.id }"
-                    role="button"
-                    tabindex="0"
-                    @click="openArtifactPreview(artifact)"
-                    @keydown.enter="openArtifactPreview(artifact)"
-                  >
-                    <span class="artifact-file-icon" :data-kind="artifactFileType(artifact)">{{ artifactFileType(artifact).slice(0, 1) }}</span>
-                    <div class="artifact-file-copy">
-                      <strong>{{ artifact.title || artifact.content?.file?.filename }}</strong>
-                      <small>{{ artifact.content?.file?.filename }} · {{ formatFileSize(artifact.content?.file?.size || 0) }}</small>
-                    </div>
-                    <a v-if="artifact.content?.file?.download_url" class="artifact-download" :href="artifact.content.file.download_url" download @click.stop>下载</a>
-                    <span v-else class="artifact-pending">准备中</span>
-                  </article>
+                <div v-if="runAnswer(turn.latestRun)" class="historical-answer markdown-body"
+                  :class="{ 'without-reasoning': !runReasoning(turn.latestRun) }"
+                  v-html="renderMarkdown(runAnswer(turn.latestRun))"
+                  @click="handleCitationClick($event, turn.latestRun)"></div>
+                <div v-else-if="turn.latestRun.error" class="run-error compact-error">
+                  <p>{{ turn.latestRun.error }}</p>
                 </div>
-              </section>
+                <div v-else-if="turn.latestRun.status === 'cancelled'" class="run-cancelled compact-cancelled">
+                  <span>回答已停止</span>
+                  <button type="button" :disabled="isRetrying || isResponseActive"
+                    @click="retryRun(turn.latestRun)">重新开始</button>
+                </div>
+                <button v-if="runCitations(turn.latestRun).length" class="citation-summary-chip" type="button"
+                  @click="openRunCitations(turn.latestRun)">
+                  <span class="citation-summary-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24">
+                      <path
+                        d="M10 13a5 5 0 0 0 7.1.1l2-2A5 5 0 0 0 12 4l-1.1 1.1M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1">
+                      </path>
+                    </svg>
+                  </span>
+                  <span class="citation-site-stack" aria-hidden="true">
+                    <i v-for="citation in runCitations(turn.latestRun).slice(0, 3)" :key="citation.id">{{
+                      sourceInitial(citation)
+                    }}</i>
+                  </span>
+                  <strong>{{ runCitations(turn.latestRun).length }} 个网页</strong>
+                </button>
+                <section v-if="runArtifacts(turn.latestRun).length" class="artifact-deliveries compact-artifacts">
+                  <header><strong>生成文件</strong><span>{{ runArtifacts(turn.latestRun).length }} 个</span></header>
+                  <div class="artifact-delivery-list">
+                    <article v-for="artifact in runArtifacts(turn.latestRun)" :key="artifact.id"
+                      class="artifact-delivery-card" :class="{ selected: selectedArtifact?.id === artifact.id }"
+                      role="button" tabindex="0" @click="openArtifactPreview(artifact)"
+                      @keydown.enter="openArtifactPreview(artifact)">
+                      <span class="artifact-file-icon" :data-kind="artifactFileType(artifact)">{{
+                        artifactFileType(artifact).slice(0, 1) }}</span>
+                      <div class="artifact-file-copy">
+                        <strong>{{ artifact.title || artifact.content?.file?.filename }}</strong>
+                        <small>{{ artifact.content?.file?.filename }} · {{ formatFileSize(artifact.content?.file?.size
+                          || 0)
+                        }}</small>
+                      </div>
+                      <a v-if="artifact.content?.file?.download_url" class="artifact-download"
+                        :href="artifact.content.file.download_url" download @click.stop>下载</a>
+                      <span v-else class="artifact-pending">准备中</span>
+                    </article>
+                  </div>
+                </section>
               </section>
               <div v-if="runAnswer(turn.latestRun)" class="answer-actions" aria-label="回答操作">
-                <button
-                  type="button"
-                  :class="{ 'is-copied': copiedAnswerRunId === turn.latestRun.id }"
+                <button type="button" :class="{ 'is-copied': copiedAnswerRunId === turn.latestRun.id }"
                   :aria-label="copiedAnswerRunId === turn.latestRun.id ? '已复制回答' : '复制回答'"
                   :title="copiedAnswerRunId === turn.latestRun.id ? '已复制' : '复制回答'"
-                  @click="copyRunAnswer(turn.latestRun)"
-                >
-                  <svg v-if="copiedAnswerRunId === turn.latestRun.id" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>
-                  <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+                  @click="copyRunAnswer(turn.latestRun)">
+                  <svg v-if="copiedAnswerRunId === turn.latestRun.id" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="m5 12.5 4.2 4.2L19 7"></path>
+                  </svg>
+                  <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="8" y="8" width="11" height="11" rx="2"></rect>
+                    <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path>
+                  </svg>
                 </button>
-                <button
-                  type="button"
-                  aria-label="重新生成回答"
-                  title="重新生成"
-                  :disabled="isRetrying || isResponseActive"
-                  @click="rerunRun(turn.latestRun)"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"></path><path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path></svg>
+                <button type="button" aria-label="重新生成回答" title="重新生成" :disabled="isRetrying || isResponseActive"
+                  @click="rerunRun(turn.latestRun)">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 6v5h-5"></path>
+                    <path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path>
+                  </svg>
                 </button>
               </div>
             </div>
@@ -2683,26 +2717,24 @@ function formatTime(value: string): string {
             <div class="avatar">我</div>
             <div class="bubble user-bubble" :tabindex="isTerminalRun(activeRun) ? 0 : undefined">
               <div v-if="activeRun.attachments?.length" class="sent-attachment-grid">
-                <article
-                  v-for="(attachment, index) in activeRun.attachments"
-                  :key="`${activeRun.id}-${attachment.filename}-${index}`"
-                  class="attachment-card sent-attachment-card"
-                >
-                  <span class="file-glyph" :data-kind="attachmentTypeByExtension(attachment.extension)" aria-hidden="true">{{ attachmentTypeByExtension(attachment.extension).slice(0, 1) }}</span>
-                  <div><strong>{{ attachment.filename }}</strong><small>{{ attachmentTypeByExtension(attachment.extension) }} · {{ formatFileSize(attachment.file_size) }}</small></div>
+                <article v-for="(attachment, index) in activeRun.attachments"
+                  :key="`${activeRun.id}-${attachment.filename}-${index}`" class="attachment-card sent-attachment-card">
+                  <span class="file-glyph" :data-kind="attachmentTypeByExtension(attachment.extension)"
+                    aria-hidden="true">{{
+                      attachmentTypeByExtension(attachment.extension).slice(0, 1) }}</span>
+                  <div><strong>{{ attachment.filename }}</strong><small>{{
+                    attachmentTypeByExtension(attachment.extension) }} ·
+                      {{ formatFileSize(attachment.file_size) }}</small></div>
                 </article>
               </div>
               <div v-if="editingRunId === activeRun.id" class="user-question-editor">
-                <textarea
-                  v-model="editingQuestion"
-                  rows="3"
-                  aria-label="编辑问题"
-                  @keydown="handleEditKeydown($event, activeRun)"
-                ></textarea>
+                <textarea v-model="editingQuestion" rows="3" aria-label="编辑问题"
+                  @keydown="handleEditKeydown($event, activeRun)"></textarea>
                 <span v-if="editError" class="question-edit-error">{{ editError }}</span>
                 <div class="question-edit-actions">
                   <button type="button" @click="cancelEditing">取消</button>
-                  <button type="button" :disabled="isRetrying || !editingQuestion.trim()" @click="submitEditedRun(activeRun)">
+                  <button type="button" :disabled="isRetrying || !editingQuestion.trim()"
+                    @click="submitEditedRun(activeRun)">
                     {{ isRetrying ? '发送中…' : '发送' }}
                   </button>
                 </div>
@@ -2710,14 +2742,9 @@ function formatTime(value: string): string {
               <template v-else>
                 <p>{{ activeRun.question }}</p>
                 <div v-if="isTerminalRun(activeRun)" class="question-actions" aria-label="问题操作">
-                  <button
-                    class="question-action-button"
-                    :class="{ 'is-copied': copiedRunId === activeRun.id }"
-                    type="button"
-                    :aria-label="copiedRunId === activeRun.id ? '已复制' : '复制问题'"
-                    :title="copiedRunId === activeRun.id ? '已复制' : '复制'"
-                    @click="copyRunQuestion(activeRun)"
-                  >
+                  <button class="question-action-button" :class="{ 'is-copied': copiedRunId === activeRun.id }"
+                    type="button" :aria-label="copiedRunId === activeRun.id ? '已复制' : '复制问题'"
+                    :title="copiedRunId === activeRun.id ? '已复制' : '复制'" @click="copyRunQuestion(activeRun)">
                     <svg v-if="copiedRunId === activeRun.id" viewBox="0 0 24 24" aria-hidden="true">
                       <path d="m5 12.5 4.2 4.2L19 7"></path>
                     </svg>
@@ -2726,13 +2753,8 @@ function formatTime(value: string): string {
                       <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path>
                     </svg>
                   </button>
-                  <button
-                    class="question-action-button"
-                    type="button"
-                    aria-label="编辑问题"
-                    title="编辑"
-                    @click="startEditing(activeRun)"
-                  >
+                  <button class="question-action-button" type="button" aria-label="编辑问题" title="编辑"
+                    @click="startEditing(activeRun)">
                     <svg viewBox="0 0 24 24" aria-hidden="true">
                       <path d="M13.5 6.5 17.5 10.5"></path>
                       <path d="M4 20h4l10.5-10.5a2.8 2.8 0 0 0-4-4L4 16v4Z"></path>
@@ -2746,316 +2768,284 @@ function formatTime(value: string): string {
             <div class="avatar agent-avatar">A</div>
             <div class="agent-response-column">
               <section class="agent-panel">
-              <header class="agent-message-header">
-                <div>
-                  <strong>{{ activeAgent?.display_name || 'Agent' }}</strong>
-                  <span :class="`status-${activeRun.status}`">{{ runStatusText }}</span>
-                </div>
-                
-              </header>
-
-              <section v-if="approvalRequest" class="approval-card" aria-labelledby="approval-title">
-                <header>
+                <header class="agent-message-header">
                   <div>
-                    <span class="risk-mark">HIGH RISK</span>
-                    <h2 id="approval-title">服务器隔离命令待审批</h2>
+                    <strong>{{ activeAgent?.display_name || 'Agent' }}</strong>
+                    <span :class="`status-${activeRun.status}`">{{ runStatusText }}</span>
                   </div>
-                  <span class="sandbox-badge">隔离容器 · 禁止联网</span>
+
                 </header>
-                <p>批准只对当前 Run、当前参数摘要生效，不会授权后续命令。</p>
-                <pre><code>{{ approvalCommand }}</code></pre>
-                <dl>
-                  <div><dt>工作目录</dt><dd>{{ approvalRequest.arguments.cwd || '.' }}</dd></div>
-                  <div><dt>超时</dt><dd>{{ approvalRequest.arguments.timeout || 30 }} 秒</dd></div>
-                  <div><dt>参数摘要</dt><dd class="argument-hash">{{ approvalRequest.argument_hash }}</dd></div>
-                </dl>
-                <label class="approval-key-field">
-                  <span>审批口令</span>
-                  <input
-                    v-model="approvalKey"
-                    type="password"
-                    autocomplete="off"
-                    placeholder="仅保存在当前浏览器会话"
-                    :disabled="approvalBusy || approvalRequest.status === 'resuming'"
-                  />
-                </label>
-                <div class="approval-actions">
-                  <span v-if="approvalError">{{ approvalError }}</span>
-                  <button class="reject-command" type="button"
-                    :disabled="approvalBusy || approvalRequest.status === 'resuming'"
-                    @click="decideToolRequest('reject')">拒绝</button>
-                  <button class="approve-command" type="button"
-                    :disabled="approvalBusy || approvalRequest.status === 'resuming'"
-                    @click="decideToolRequest('approve')">
-                    {{ approvalRequest.status === 'resuming' ? '正在提交…' : '批准本次执行' }}
-                  </button>
-                </div>
-              </section>
 
-              <section
-                v-if="isPreparingResponse"
-                class="reasoning-panel is-active response-preparing"
-                role="status"
-                aria-live="polite"
-              >
-                <div class="response-preparing-header">
-                  <span class="reasoning-orb" aria-hidden="true">✦</span>
-                  <div class="response-preparing-copy">
-                    <strong>{{ preparingResponseTitle }}</strong>
-                    <small>{{ preparingResponseDetail }}</small>
-                  </div>
-                  <span class="response-preparing-dots" aria-hidden="true">
-                    <i></i><i></i><i></i>
-                  </span>
-                </div>
-              </section>
-
-              <section v-if="reasoningText || isReasoning" class="reasoning-panel" :class="{ 'is-active': isReasoning }">
-                <button class="reasoning-toggle" type="button" @click="reasoningExpanded = !reasoningExpanded">
-                  <span class="reasoning-orb" aria-hidden="true">✦</span>
-                  <strong class="reasoning-status">
-                    <span>{{ isReasoning ? '正在深度思考' : '已深度思考' }}</span>
-                    <time>{{ reasoningElapsedText }}</time>
-                  </strong>
-                  <span class="reasoning-chevron" :class="{ expanded: reasoningExpanded }">⌄</span>
-                </button>
-                <Transition name="reasoning-collapse">
-                  <div
-                    v-if="reasoningExpanded"
-                    ref="reasoningScroll"
-                    class="reasoning-content markdown-body"
-                    :class="{ 'is-reasoning': isReasoning }"
-                    @scroll="handleReasoningScroll"
-                    v-html="renderedReasoning"
-                  ></div>
-                </Transition>
-              </section>
-
-              <div v-if="summary" class="metric-grid">
-                <div><span>人数</span><strong>{{ summary.employee_count }}</strong></div>
-                <div><span>出勤</span><strong>{{ summary.total_attendance_days }} 天</strong></div>
-                <div><span>迟到</span><strong>{{ summary.total_late_count }} 次</strong></div>
-                <div><span>扣款</span><strong>{{ summary.total_deduction }} 元</strong></div>
-              </div>
-              <div v-if="focusEmployees.length" class="result-table-wrap">
-                <div class="result-table-heading">
-                  <strong>重点关注人员</strong>
-                  <span>共 {{ focusEmployees.length }} 人</span>
-                </div>
-                <table class="result-table">
-                  <thead>
-                    <tr>
-                      <th>姓名</th>
-                      <th v-for="metric in exceptionMetrics" :key="metric.type">{{ metric.label }}</th>
-                      <th>关注原因</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="row in focusEmployees" :key="row.employee_key || row.name">
-                      <td>{{ row.name }}</td>
-                      <td v-for="metric in exceptionMetrics" :key="metric.type">
-                        <span v-if="!Number(row[metric.countKey] || 0)">0</span>
-                        <button
-                          v-else
-                          class="exception-tip-trigger"
-                          type="button"
-                          :class="{ active: activeExceptionTip?.key === `${row.employee_key || row.name}:${metric.type}` }"
-                          :aria-expanded="activeExceptionTip?.key === `${row.employee_key || row.name}:${metric.type}`"
-                          :aria-label="`查看${row.name}${metric.label}详情`"
-                          :title="`查看${metric.label}详情`"
-                          @click="toggleExceptionTip($event, row, metric)"
-                        >
-                          <span>{{ row[metric.countKey] }}</span><i aria-hidden="true">i</i>
-                        </button>
-                      </td>
-                      <td>{{ employeeAttentionText(row) }}</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-
-              <Teleport to="body">
-                <div
-                  v-if="activeExceptionTip"
-                  ref="exceptionTipPanel"
-                  class="exception-tip-panel exception-tip-floating"
-                  :style="{ top: `${activeExceptionTip.top}px`, left: `${activeExceptionTip.left}px` }"
-                  role="dialog"
-                  :aria-label="`${activeExceptionTip.row.name}${activeExceptionTip.metric.label}详情`"
-                  @pointerdown.stop
-                >
-                  <header><strong>{{ activeExceptionTip.row.name }} · {{ activeExceptionTip.metric.label }}详情</strong></header>
-                  <template v-if="activeExceptionDetails.length">
-                    <article
-                      v-for="(detail, detailIndex) in activeExceptionDetails"
-                      :key="`${detail.date}-${detailIndex}`"
-                    >
-                      <strong>{{ detail.date }}</strong>
-                      <ul v-if="detail.events.length">
-                        <li v-for="(event, eventIndex) in detail.events" :key="eventIndex">
-                          {{ event.punch_type }}：应打卡 {{ event.expected_time || '—' }}，实际 {{ event.actual_time || '未打卡' }}，状态“{{ event.status || '异常' }}”
-                        </li>
-                      </ul>
-                      <p>考勤机：{{ detail.machine_punches.length ? detail.machine_punches.join('、') : '无有效打卡' }}</p>
-                      <p>判定：{{ detail.reason || '—' }}</p>
-                    </article>
-                  </template>
-                  <p v-else class="exception-tip-empty">旧会话未保存异常明细，请重新分析附件。</p>
-                </div>
-              </Teleport>
-
-              <div
-                v-if="typedAnswer || isTyping"
-                class="answer-text"
-                :class="{ 'without-reasoning': !reasoningText && !isReasoning }"
-                aria-live="polite"
-              >
-                <header><strong>最终答复</strong><span :class="{ streaming: isTyping }">{{ isTyping ? '正在生成' : '生成完成' }}</span></header>
-                <div
-                  class="markdown-body"
-                  :class="{ 'is-typing': isTyping }"
-                  v-html="renderedAnswer"
-                  @click="handleCitationClick($event)"
-                ></div>
-              </div>
-
-              <button
-                v-if="answerPlaybackCompleted && activeCitations.length"
-                class="citation-summary-chip"
-                type="button"
-                @click="openCitationSources(activeCitations)"
-              >
-                <span class="citation-summary-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1.1l2-2A5 5 0 0 0 12 4l-1.1 1.1M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1"></path></svg>
-                </span>
-                <span class="citation-site-stack" aria-hidden="true">
-                  <i v-for="citation in activeCitations.slice(0, 3)" :key="citation.id">{{ sourceInitial(citation) }}</i>
-                </span>
-                <strong>{{ activeCitations.length }} 个网页</strong>
-              </button>
-
-              <section v-if="showActiveArtifacts && runArtifacts(activeRun).length" class="artifact-deliveries">
-                <header><strong>已生成文件</strong><span>可下载并继续使用</span></header>
-                <div class="artifact-delivery-list">
-                  <article
-                    v-for="artifact in runArtifacts(activeRun)"
-                    :key="artifact.id"
-                    class="artifact-delivery-card"
-                    :class="{ selected: selectedArtifact?.id === artifact.id }"
-                    role="button"
-                    tabindex="0"
-                    @click="openArtifactPreview(artifact)"
-                    @keydown.enter="openArtifactPreview(artifact)"
-                  >
-                    <span class="artifact-file-icon" :data-kind="artifactFileType(artifact)">{{ artifactFileType(artifact).slice(0, 1) }}</span>
-                    <div class="artifact-file-copy">
-                      <strong>{{ artifact.title || artifact.content?.file?.filename }}</strong>
-                      <small>{{ artifact.content?.file?.filename }} · {{ formatFileSize(artifact.content?.file?.size || 0) }}</small>
+                <section v-if="approvalRequest" class="approval-card" aria-labelledby="approval-title">
+                  <header>
+                    <div>
+                      <span class="risk-mark">HIGH RISK</span>
+                      <h2 id="approval-title">服务器隔离命令待审批</h2>
                     </div>
-                    <a v-if="artifact.content?.file?.download_url" class="artifact-download" :href="artifact.content.file.download_url" download @click.stop>下载文件</a>
-                    <span v-else class="artifact-pending">准备中</span>
-                  </article>
-                </div>
-              </section>
+                    <span class="sandbox-badge">隔离容器 · 禁止联网</span>
+                  </header>
+                  <p>批准只对当前 Run、当前参数摘要生效，不会授权后续命令。</p>
+                  <pre><code>{{ approvalCommand }}</code></pre>
+                  <dl>
+                    <div>
+                      <dt>工作目录</dt>
+                      <dd>{{ approvalRequest.arguments.cwd || '.' }}</dd>
+                    </div>
+                    <div>
+                      <dt>超时</dt>
+                      <dd>{{ approvalRequest.arguments.timeout || 30 }} 秒</dd>
+                    </div>
+                    <div>
+                      <dt>参数摘要</dt>
+                      <dd class="argument-hash">{{ approvalRequest.argument_hash }}</dd>
+                    </div>
+                  </dl>
+                  <label class="approval-key-field">
+                    <span>审批口令</span>
+                    <input v-model="approvalKey" type="password" autocomplete="off" placeholder="仅保存在当前浏览器会话"
+                      :disabled="approvalBusy || approvalRequest.status === 'resuming'" />
+                  </label>
+                  <div class="approval-actions">
+                    <span v-if="approvalError">{{ approvalError }}</span>
+                    <button class="reject-command" type="button"
+                      :disabled="approvalBusy || approvalRequest.status === 'resuming'"
+                      @click="decideToolRequest('reject')">拒绝</button>
+                    <button class="approve-command" type="button"
+                      :disabled="approvalBusy || approvalRequest.status === 'resuming'"
+                      @click="decideToolRequest('approve')">
+                      {{ approvalRequest.status === 'resuming' ? '正在提交…' : '批准本次执行' }}
+                    </button>
+                  </div>
+                </section>
 
-              <div v-if="activeRun.status === 'cancelled'" class="run-cancelled">
-                <div>
-                  <strong>已停止生成</strong>
-                  <span>已保留当前回答、执行轨迹和已生成文件。</span>
+                <section v-if="isPreparingResponse" class="reasoning-panel is-active response-preparing" role="status"
+                  aria-live="polite">
+                  <div class="response-preparing-header">
+                    <span class="reasoning-orb" aria-hidden="true">✦</span>
+                    <div class="response-preparing-copy">
+                      <strong>{{ preparingResponseTitle }}</strong>
+                      <small>{{ preparingResponseDetail }}</small>
+                    </div>
+                    <span class="response-preparing-dots" aria-hidden="true">
+                      <i></i><i></i><i></i>
+                    </span>
+                  </div>
+                </section>
+
+                <section v-if="reasoningText || isReasoning" class="reasoning-panel"
+                  :class="{ 'is-active': isReasoning }">
+                  <button class="reasoning-toggle" type="button" @click="reasoningExpanded = !reasoningExpanded">
+                    <span class="reasoning-orb" aria-hidden="true">✦</span>
+                    <strong class="reasoning-status">
+                      <span>{{ isReasoning ? '正在深度思考' : '已深度思考' }}</span>
+                      <time>{{ reasoningElapsedText }}</time>
+                    </strong>
+                    <span class="reasoning-chevron" :class="{ expanded: reasoningExpanded }">⌄</span>
+                  </button>
+                  <Transition name="reasoning-collapse">
+                    <div v-if="reasoningExpanded" ref="reasoningScroll" class="reasoning-content markdown-body"
+                      :class="{ 'is-reasoning': isReasoning }" @scroll="handleReasoningScroll"
+                      v-html="renderedReasoning"></div>
+                  </Transition>
+                </section>
+
+                <div v-if="summary" class="metric-grid">
+                  <div><span>人数</span><strong>{{ summary.employee_count }}</strong></div>
+                  <div><span>出勤</span><strong>{{ summary.total_attendance_days }} 天</strong></div>
+                  <div><span>迟到</span><strong>{{ summary.total_late_count }} 次</strong></div>
+                  <div><span>扣款</span><strong>{{ summary.total_deduction }} 元</strong></div>
                 </div>
-                <button type="button" :disabled="isRetrying" @click="retryRun(activeRun)">
-                  {{ isRetrying ? '正在重新开始…' : '重新开始' }}
+                <div v-if="focusEmployees.length" class="result-table-wrap">
+                  <div class="result-table-heading">
+                    <strong>重点关注人员</strong>
+                    <span>共 {{ focusEmployees.length }} 人</span>
+                  </div>
+                  <table class="result-table">
+                    <thead>
+                      <tr>
+                        <th>姓名</th>
+                        <th v-for="metric in exceptionMetrics" :key="metric.type">{{ metric.label }}</th>
+                        <th>关注原因</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="row in focusEmployees" :key="row.employee_key || row.name">
+                        <td>{{ row.name }}</td>
+                        <td v-for="metric in exceptionMetrics" :key="metric.type">
+                          <span v-if="!Number(row[metric.countKey] || 0)">0</span>
+                          <button v-else class="exception-tip-trigger" type="button"
+                            :class="{ active: activeExceptionTip?.key === `${row.employee_key || row.name}:${metric.type}` }"
+                            :aria-expanded="activeExceptionTip?.key === `${row.employee_key || row.name}:${metric.type}`"
+                            :aria-label="`查看${row.name}${metric.label}详情`" :title="`查看${metric.label}详情`"
+                            @click="toggleExceptionTip($event, row, metric)">
+                            <span>{{ row[metric.countKey] }}</span><i aria-hidden="true">i</i>
+                          </button>
+                        </td>
+                        <td>{{ employeeAttentionText(row) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <Teleport to="body">
+                  <div v-if="activeExceptionTip" ref="exceptionTipPanel"
+                    class="exception-tip-panel exception-tip-floating"
+                    :style="{ top: `${activeExceptionTip.top}px`, left: `${activeExceptionTip.left}px` }" role="dialog"
+                    :aria-label="`${activeExceptionTip.row.name}${activeExceptionTip.metric.label}详情`"
+                    @pointerdown.stop>
+                    <header><strong>{{ activeExceptionTip.row.name }} · {{ activeExceptionTip.metric.label }}详情</strong>
+                    </header>
+                    <template v-if="activeExceptionDetails.length">
+                      <article v-for="(detail, detailIndex) in activeExceptionDetails"
+                        :key="`${detail.date}-${detailIndex}`">
+                        <strong>{{ detail.date }}</strong>
+                        <ul v-if="detail.events.length">
+                          <li v-for="(event, eventIndex) in detail.events" :key="eventIndex">
+                            {{ event.punch_type }}：应打卡 {{ event.expected_time || '—' }}，实际 {{ event.actual_time || '未打卡'
+                            }}，状态“{{ event.status || '异常' }}”
+                          </li>
+                        </ul>
+                        <p>考勤机：{{ detail.machine_punches.length ? detail.machine_punches.join('、') : '无有效打卡' }}</p>
+                        <p>判定：{{ detail.reason || '—' }}</p>
+                      </article>
+                    </template>
+                    <p v-else class="exception-tip-empty">旧会话未保存异常明细，请重新分析附件。</p>
+                  </div>
+                </Teleport>
+
+                <div v-if="typedAnswer || isTyping" class="answer-text"
+                  :class="{ 'without-reasoning': !reasoningText && !isReasoning }" aria-live="polite">
+                  <header><strong>最终答复</strong><span :class="{ streaming: isTyping }">{{ isTyping ? '正在生成' : '生成完成'
+                      }}</span>
+                  </header>
+                  <div class="markdown-body" :class="{ 'is-typing': isTyping }" v-html="renderedAnswer"
+                    @click="handleCitationClick($event)"></div>
+                </div>
+
+                <button v-if="answerPlaybackCompleted && activeCitations.length" class="citation-summary-chip"
+                  type="button" @click="openCitationSources(activeCitations)">
+                  <span class="citation-summary-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24">
+                      <path
+                        d="M10 13a5 5 0 0 0 7.1.1l2-2A5 5 0 0 0 12 4l-1.1 1.1M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1">
+                      </path>
+                    </svg>
+                  </span>
+                  <span class="citation-site-stack" aria-hidden="true">
+                    <i v-for="citation in activeCitations.slice(0, 3)" :key="citation.id">{{ sourceInitial(citation)
+                    }}</i>
+                  </span>
+                  <strong>{{ activeCitations.length }} 个网页</strong>
                 </button>
-              </div>
 
-              <div v-if="failureDetail" class="run-error">
-                <p>{{ failureDetail }}</p>
-                <div class="run-error-actions">
-                  <span v-if="retryError">{{ retryError }}</span>
-                  <button type="button" :disabled="isRetrying || isSubmitting" @click="retryFailedRun">
-                    {{ isSubmitting ? '正在重新发送…' : isRetrying ? '正在重新执行…' : isLocalUploadRun(activeRun) ? '重新发送' : '重新执行' }}
+                <section v-if="showActiveArtifacts && runArtifacts(activeRun).length" class="artifact-deliveries">
+                  <header><strong>已生成文件</strong><span>可下载并继续使用</span></header>
+                  <div class="artifact-delivery-list">
+                    <article v-for="artifact in runArtifacts(activeRun)" :key="artifact.id"
+                      class="artifact-delivery-card" :class="{ selected: selectedArtifact?.id === artifact.id }"
+                      role="button" tabindex="0" @click="openArtifactPreview(artifact)"
+                      @keydown.enter="openArtifactPreview(artifact)">
+                      <span class="artifact-file-icon" :data-kind="artifactFileType(artifact)">{{
+                        artifactFileType(artifact).slice(0, 1) }}</span>
+                      <div class="artifact-file-copy">
+                        <strong>{{ artifact.title || artifact.content?.file?.filename }}</strong>
+                        <small>{{ artifact.content?.file?.filename }} · {{ formatFileSize(artifact.content?.file?.size
+                          || 0)
+                        }}</small>
+                      </div>
+                      <a v-if="artifact.content?.file?.download_url" class="artifact-download"
+                        :href="artifact.content.file.download_url" download @click.stop>下载文件</a>
+                      <span v-else class="artifact-pending">准备中</span>
+                    </article>
+                  </div>
+                </section>
+
+                <div v-if="activeRun.status === 'cancelled'" class="run-cancelled">
+                  <div>
+                    <strong>已停止生成</strong>
+                    <span>已保留当前回答、执行轨迹和已生成文件。</span>
+                  </div>
+                  <button type="button" :disabled="isRetrying" @click="retryRun(activeRun)">
+                    {{ isRetrying ? '正在重新开始…' : '重新开始' }}
                   </button>
                 </div>
-              </div>
+
+                <div v-if="failureDetail" class="run-error">
+                  <p>{{ failureDetail }}</p>
+                  <div class="run-error-actions">
+                    <span v-if="retryError">{{ retryError }}</span>
+                    <button type="button" :disabled="isRetrying || isSubmitting" @click="retryFailedRun">
+                      {{ isSubmitting ? '正在重新发送…' : isRetrying ? '正在重新执行…' : isLocalUploadRun(activeRun) ? '重新发送' :
+                        '重新执行' }}
+                    </button>
+                  </div>
+                </div>
 
               </section>
-              <div
-                v-if="answerPlaybackCompleted && typedAnswer && !isRunActive"
-                class="answer-actions"
-                aria-label="回答操作"
-              >
-                <button
-                  type="button"
-                  :class="{ 'is-copied': copiedAnswerRunId === activeRun.id }"
-                  :aria-label="copiedAnswerRunId === activeRun.id ? '已复制回答' : '复制回答'"
-                  :title="copiedAnswerRunId === activeRun.id ? '已复制' : '复制回答'"
-                  @click="copyRunAnswer(activeRun)"
-                >
-                  <svg v-if="copiedAnswerRunId === activeRun.id" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"></path></svg>
-                  <svg v-else viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
-                </button>
-                <button
-                  type="button"
-                  aria-label="重新生成回答"
-                  title="重新生成"
-                  :disabled="isRetrying || isResponseActive"
-                  @click="rerunRun(activeRun)"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5"></path><path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path></svg>
-                </button>
+              <div v-if="answerPlaybackCompleted && typedAnswer && !isRunActive" class="answer-actions"
+                aria-label="回答操作">
+                <div v-if="activeRun.total_tokens" class="run-token-summary">
+                  <span>本次消耗</span>
+                  <strong>{{ activeRun.total_tokens.toLocaleString() }} tokens</strong>
+                  <small v-if="activeRun.prompt_tokens != null && activeRun.completion_tokens != null">
+                    （输入 {{ activeRun.prompt_tokens.toLocaleString() }} / 输出 {{
+                      activeRun.completion_tokens.toLocaleString() }}）
+                  </small>
+                </div>
+                <div class="answer-actions-buttons">
+                  <button type="button" :class="{ 'is-copied': copiedAnswerRunId === activeRun.id }"
+                    :aria-label="copiedAnswerRunId === activeRun.id ? '已复制回答' : '复制回答'"
+                    :title="copiedAnswerRunId === activeRun.id ? '已复制' : '复制回答'" @click="copyRunAnswer(activeRun)">
+                    <svg v-if="copiedAnswerRunId === activeRun.id" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="m5 12.5 4.2 4.2L19 7"></path>
+                    </svg>
+                    <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="8" y="8" width="11" height="11" rx="2"></rect>
+                      <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path>
+                    </svg>
+                  </button>
+                  <button type="button" aria-label="重新生成回答" title="重新生成" :disabled="isRetrying || isResponseActive"
+                    @click="rerunRun(activeRun)">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M20 6v5h-5"></path>
+                      <path d="M19 11a7.5 7.5 0 1 0-.9 5.4"></path>
+                    </svg>
+                  </button>
+                </div>
               </div>
             </div>
           </article>
         </section>
       </div>
-      <footer
-        class="composer-wrap"
-        @paste="onPaste"
-        @dragenter.prevent="isDragging = true"
-        @dragover.prevent="isDragging = true"
-        @dragleave.prevent="isDragging = false"
-        @drop.prevent="onDrop"
-      >
+      <footer class="composer-wrap" @paste="onPaste" @dragenter.prevent="isDragging = true"
+        @dragover.prevent="isDragging = true" @dragleave.prevent="isDragging = false" @drop.prevent="onDrop">
         <div class="composer" :class="{ dragging: isDragging, ['mode-' + responseMode]: true }">
           <div class="response-mode-bar">
-            <div
-              class="response-mode-picker"
-              :class="{ 'is-expert': responseMode === 'expert' }"
-              role="group"
-              aria-label="回答模式"
-            >
+            <div class="response-mode-picker" :class="{ 'is-expert': responseMode === 'expert' }" role="group"
+              aria-label="回答模式">
               <span class="response-mode-slider" aria-hidden="true"></span>
-              <button
-                type="button"
-                :class="{ active: responseMode === 'fast' }"
-                :aria-pressed="responseMode === 'fast'"
-                :disabled="isResponseActive || isSubmitting"
-                title="优先响应，适合日常问答和简单工具任务"
-                @click="selectResponseMode('fast')"
-              ><span aria-hidden="true">⚡</span>快速模式</button>
-              <button
-                type="button"
-                :class="{ active: responseMode === 'expert' }"
-                :aria-pressed="responseMode === 'expert'"
-                :disabled="isResponseActive || isSubmitting"
-                title="先规划再执行，适合复杂和高准确度任务"
-                @click="selectResponseMode('expert')"
-              ><span aria-hidden="true">✦</span>专家模式</button>
+              <button type="button" :class="{ active: responseMode === 'fast' }" :aria-pressed="responseMode === 'fast'"
+                :disabled="isResponseActive || isSubmitting" title="优先响应，适合日常问答和简单工具任务"
+                @click="selectResponseMode('fast')"><span aria-hidden="true">⚡</span>快速模式</button>
+              <button type="button" :class="{ active: responseMode === 'expert' }"
+                :aria-pressed="responseMode === 'expert'" :disabled="isResponseActive || isSubmitting"
+                title="先规划再执行，适合复杂和高准确度任务" @click="selectResponseMode('expert')"><span
+                  aria-hidden="true">✦</span>专家模式</button>
             </div>
           </div>
           <section v-if="hasTable" class="composer-attachments" aria-label="已添加的附件">
             <div class="attachment-grid">
-              <article
-                v-for="(file, index) in attachments"
-                :key="`${file.name}-${file.size}-${file.lastModified}`"
-                class="attachment-card"
-              >
-                <span class="file-glyph" :data-kind="attachmentType(file)" aria-hidden="true">{{ attachmentType(file).slice(0, 1) }}</span>
+              <article v-for="(file, index) in attachments" :key="`${file.name}-${file.size}-${file.lastModified}`"
+                class="attachment-card">
+                <span class="file-glyph" :data-kind="attachmentType(file)" aria-hidden="true">{{
+                  attachmentType(file).slice(0,
+                    1) }}</span>
                 <div>
                   <strong>{{ file.name }}</strong>
                   <small>{{ attachmentType(file) }} · {{ formatFileSize(file.size) }} · 已就绪</small>
                 </div>
-                <button type="button" aria-label="移除附件" title="移除附件" :disabled="isSubmitting" @click="removeAttachment(index)">×</button>
+                <button type="button" aria-label="移除附件" title="移除附件" :disabled="isSubmitting"
+                  @click="removeAttachment(index)">×</button>
               </article>
               <article v-if="hasClipboardTable" class="attachment-card">
                 <span class="file-glyph" data-kind="Excel" aria-hidden="true">X</span>
@@ -3065,40 +3055,28 @@ function formatTime(value: string): string {
             </div>
             <div class="attachment-prompts">
               <template v-if="hasAttendanceData">
-                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('分析考勤数据，统计迟到、早退、缺卡情况')">统计考勤异常 <span>→</span></button>
-                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('核对打卡记录差异，标注异常员工')">核对打卡差异 <span>→</span></button>
-                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('汇总出勤情况并生成考勤异常报告')">生成考勤报告 <span>→</span></button>
+                <button type="button" :disabled="isSubmitting"
+                  @click="applyAttachmentPrompt('分析考勤数据，统计迟到、早退、缺卡情况')">统计考勤异常 <span>→</span></button>
+                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('核对打卡记录差异，标注异常员工')">核对打卡差异
+                  <span>→</span></button>
+                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('汇总出勤情况并生成考勤异常报告')">生成考勤报告
+                  <span>→</span></button>
               </template>
               <template v-else>
-                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('梳理附件的重点内容，并给出结构化总结')">梳理重点内容 <span>→</span></button>
-                <button type="button" :disabled="isSubmitting" @click="applyAttachmentPrompt('分析附件，找出关键结论、异常和需要关注的问题')">分析并找出问题 <span>→</span></button>
+                <button type="button" :disabled="isSubmitting"
+                  @click="applyAttachmentPrompt('梳理附件的重点内容，并给出结构化总结')">梳理重点内容 <span>→</span></button>
+                <button type="button" :disabled="isSubmitting"
+                  @click="applyAttachmentPrompt('分析附件，找出关键结论、异常和需要关注的问题')">分析并找出问题 <span>→</span></button>
               </template>
             </div>
           </section>
-          <textarea
-            v-model="question"
-            rows="3"
-            placeholder="输入您的问题，或粘贴、拖入文件进行分析…"
-            @keydown="handleComposerKeydown"
-          />
+          <textarea v-model="question" rows="3" placeholder="输入您的问题，或粘贴、拖入文件进行分析…" @keydown="handleComposerKeydown" />
           <div class="composer-tools">
             <div class="tool-left">
-              <input
-                ref="fileInput"
-                class="excel-file-input"
-                type="file"
-                accept=".xlsx,.xlsm,.csv,.pdf,.docx,.pptx,.txt,.md"
-                multiple
-                :disabled="isSubmitting"
-                @change="onFileChange"
-              />
-              <button
-                class="attach-button"
-                type="button"
-                title="添加附件"
-                :disabled="isSubmitting"
-                @click="openFilePicker"
-              >
+              <input ref="fileInput" class="excel-file-input" type="file"
+                accept=".xlsx,.xlsm,.csv,.pdf,.docx,.pptx,.txt,.md" multiple :disabled="isSubmitting"
+                @change="onFileChange" />
+              <button class="attach-button" type="button" title="添加附件" :disabled="isSubmitting" @click="openFilePicker">
                 <span aria-hidden="true">＋</span>
               </button>
               <label class="agent-picker">
@@ -3109,15 +3087,8 @@ function formatTime(value: string): string {
                 </select>
               </label>
             </div>
-            <button
-              v-if="isResponseActive"
-              class="send stop-send"
-              type="button"
-              :disabled="isStopping"
-              aria-label="停止生成"
-              title="停止生成"
-              @click="cancelActiveRun"
-            >
+            <button v-if="isResponseActive" class="send stop-send" type="button" :disabled="isStopping"
+              aria-label="停止生成" title="停止生成" @click="cancelActiveRun">
               <span class="stop-glyph" aria-hidden="true"></span>
             </button>
             <button v-else class="send" type="button" :disabled="!canSubmit" @click="submitRun">
@@ -3129,46 +3100,26 @@ function formatTime(value: string): string {
       </footer>
     </section>
 
-    <div
-      v-if="!executionCollapsed"
-      class="execution-resizer"
-      role="separator"
-      aria-label="调整右侧面板宽度"
-      aria-orientation="vertical"
-      :aria-valuemin="MIN_EXECUTION_WIDTH"
-      :aria-valuemax="MAX_EXECUTION_WIDTH"
-      :aria-valuenow="Math.round(executionWidth)"
-      tabindex="0"
-      @pointerdown="startExecutionResize"
-      @keydown.left.prevent="resizeExecutionBy(20)"
-      @keydown.right.prevent="resizeExecutionBy(-20)"
-    ></div>
+    <div v-if="!executionCollapsed" class="execution-resizer" role="separator" aria-label="调整右侧面板宽度"
+      aria-orientation="vertical" :aria-valuemin="MIN_EXECUTION_WIDTH" :aria-valuemax="MAX_EXECUTION_WIDTH"
+      :aria-valuenow="Math.round(executionWidth)" tabindex="0" @pointerdown="startExecutionResize"
+      @keydown.left.prevent="resizeExecutionBy(20)" @keydown.right.prevent="resizeExecutionBy(-20)"></div>
 
-    <aside
-      v-if="!executionCollapsed"
-      class="execution-sidebar"
-      :class="{
-        'is-preview-mode': sidebarMode !== 'trace',
-        'is-sources-mode': sidebarMode === 'sources',
-      }"
-      :aria-label="sidebarTitle"
-    >
+    <aside v-if="!executionCollapsed" class="execution-sidebar" :class="{
+      'is-preview-mode': sidebarMode !== 'trace',
+      'is-sources-mode': sidebarMode === 'sources',
+    }" :aria-label="sidebarTitle">
       <header class="execution-sidebar-header">
         <div>
           <span>{{ sidebarEyebrow }}</span>
           <strong>{{ sidebarTitle }}</strong>
         </div>
         <div class="execution-header-actions">
-          <button v-if="sidebarMode !== 'trace'" class="preview-trace-button" type="button" @click="showExecutionTrace">返回轨迹</button>
+          <button v-if="sidebarMode !== 'trace'" class="preview-trace-button" type="button"
+            @click="showExecutionTrace">返回轨迹</button>
           <small v-else>{{ processProgressText }}</small>
-          <button
-            class="sidebar-collapse-button"
-            type="button"
-            aria-label="折叠执行轨迹"
-            title="折叠执行轨迹"
-            :aria-expanded="true"
-            @click="toggleExecution"
-          >›</button>
+          <button class="sidebar-collapse-button" type="button" aria-label="折叠执行轨迹" title="折叠执行轨迹" :aria-expanded="true"
+            @click="toggleExecution">›</button>
         </div>
       </header>
 
@@ -3186,13 +3137,8 @@ function formatTime(value: string): string {
           <p v-if="selectedCitation.snippet" class="citation-browser-snippet">{{ selectedCitation.snippet }}</p>
 
           <div class="citation-browser-list" aria-label="引用来源列表">
-            <button
-              v-for="citation in sourcePanelCitations"
-              :key="citation.id"
-              type="button"
-              :class="{ selected: citation.id === selectedCitation.id }"
-              @click="selectCitation(citation)"
-            >
+            <button v-for="citation in sourcePanelCitations" :key="citation.id" type="button"
+              :class="{ selected: citation.id === selectedCitation.id }" @click="selectCitation(citation)">
               <span>{{ citation.citation_number }}</span>
               <span><strong>{{ citation.title }}</strong><small>{{ citation.domain }}</small></span>
             </button>
@@ -3203,14 +3149,9 @@ function formatTime(value: string): string {
               <span>安全网页预览</span>
               <small>若网站禁止嵌入，请点击“打开原网页”</small>
             </div>
-            <iframe
-              :key="selectedCitation.url"
-              :src="selectedCitation.url"
-              :title="`引用网页：${selectedCitation.title}`"
-              sandbox="allow-scripts allow-forms allow-popups allow-downloads"
-              referrerpolicy="no-referrer"
-              loading="lazy"
-            ></iframe>
+            <iframe :key="selectedCitation.url" :src="selectedCitation.url" :title="`引用网页：${selectedCitation.title}`"
+              sandbox="allow-scripts allow-forms allow-popups allow-downloads" referrerpolicy="no-referrer"
+              loading="lazy"></iframe>
           </div>
         </section>
       </template>
@@ -3218,10 +3159,12 @@ function formatTime(value: string): string {
       <template v-else-if="sidebarMode === 'preview' && selectedArtifact">
         <section class="file-preview-pane">
           <header class="file-preview-summary">
-            <span class="artifact-file-icon" :data-kind="artifactFileType(selectedArtifact)">{{ artifactFileType(selectedArtifact).slice(0, 1) }}</span>
+            <span class="artifact-file-icon" :data-kind="artifactFileType(selectedArtifact)">{{
+              artifactFileType(selectedArtifact).slice(0, 1) }}</span>
             <div>
               <strong>{{ selectedArtifact.title || selectedArtifactFile?.filename }}</strong>
-              <small>{{ selectedArtifactFile?.filename }} · {{ formatFileSize(selectedArtifactFile?.size || 0) }}</small>
+              <small>{{ selectedArtifactFile?.filename }} · {{ formatFileSize(selectedArtifactFile?.size || 0)
+              }}</small>
             </div>
             <a v-if="selectedArtifactFile?.download_url" :href="selectedArtifactFile.download_url" download>下载</a>
             <span v-else class="artifact-pending">准备中</span>
@@ -3235,7 +3178,9 @@ function formatTime(value: string): string {
             <div class="file-preview-table-wrap">
               <table class="file-preview-table">
                 <thead v-if="selectedArtifactPreview.headers?.length">
-                  <tr><th v-for="header in selectedArtifactPreview.headers" :key="header">{{ header }}</th></tr>
+                  <tr>
+                    <th v-for="header in selectedArtifactPreview.headers" :key="header">{{ header }}</th>
+                  </tr>
                 </thead>
                 <tbody>
                   <tr v-for="(row, rowIndex) in selectedArtifactPreview.rows || []" :key="rowIndex">
@@ -3247,17 +3192,23 @@ function formatTime(value: string): string {
             <p>当前展示生成时保存的前 {{ selectedArtifactPreview.rows?.length || 0 }} 行安全预览。</p>
           </section>
 
-          <section v-else-if="selectedArtifactPreview?.kind === 'document'" class="file-preview-content document-preview">
+          <section v-else-if="selectedArtifactPreview?.kind === 'document'"
+            class="file-preview-content document-preview">
             <h2>{{ selectedArtifactPreview.title || selectedArtifact.title }}</h2>
             <article v-for="(section, sectionIndex) in selectedArtifactPreview.sections || []" :key="sectionIndex">
               <h3 v-if="section.heading">{{ section.heading }}</h3>
-              <p v-for="(paragraph, paragraphIndex) in section.paragraphs || []" :key="`p-${paragraphIndex}`">{{ paragraph }}</p>
+              <p v-for="(paragraph, paragraphIndex) in section.paragraphs || []" :key="`p-${paragraphIndex}`">{{
+                paragraph }}</p>
               <ul v-if="section.bullets?.length">
                 <li v-for="(bullet, bulletIndex) in section.bullets" :key="bulletIndex">{{ bullet }}</li>
               </ul>
               <div v-if="section.table" class="file-preview-table-wrap">
                 <table class="file-preview-table">
-                  <thead><tr><th v-for="header in section.table.headers || []" :key="header">{{ header }}</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th v-for="header in section.table.headers || []" :key="header">{{ header }}</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     <tr v-for="(row, rowIndex) in section.table.rows || []" :key="rowIndex">
                       <td v-for="(cell, cellIndex) in row" :key="cellIndex">{{ cell }}</td>
@@ -3268,26 +3219,25 @@ function formatTime(value: string): string {
             </article>
           </section>
 
-          <section v-else-if="selectedArtifactPreview?.text" class="file-preview-content document-preview legacy-preview">
+          <section v-else-if="selectedArtifactPreview?.text"
+            class="file-preview-content document-preview legacy-preview">
             <p>{{ selectedArtifactPreview.text }}</p>
           </section>
-          <div v-else class="execution-sidebar-empty"><span>◇</span><p>该文件没有可展示的预览数据，请下载后查看。</p></div>
+          <div v-else class="execution-sidebar-empty"><span>◇</span>
+            <p>该文件没有可展示的预览数据，请下载后查看。</p>
+          </div>
         </section>
       </template>
 
       <template v-else-if="activeRun">
         <section class="process-ledger">
           <div v-if="processSteps.length" class="process-list">
-            <article
-              v-for="step in processSteps"
-              :key="step.id"
-              class="process-step"
-              :class="[
-                'is-' + step.status,
-                { 'is-waiting-approval': step.status === 'active' && activeRun.status === 'waiting_approval' },
-              ]"
-            >
-              <span class="process-marker" aria-hidden="true">{{ step.status === 'done' ? '✓' : step.status === 'failed' ? '!' : '' }}</span>
+            <article v-for="step in processSteps" :key="step.id" class="process-step" :class="[
+              'is-' + step.status,
+              { 'is-waiting-approval': step.status === 'active' && activeRun.status === 'waiting_approval' },
+            ]">
+              <span class="process-marker" aria-hidden="true">{{ step.status === 'done' ? '✓' : step.status === 'failed'
+                ? '!' : '' }}</span>
               <div>
                 <header>
                   <strong>{{ step.title }}</strong>
@@ -3300,6 +3250,7 @@ function formatTime(value: string): string {
                 </header>
                 <p>{{ step.detail }}</p>
                 <small v-if="step.meta">{{ step.meta }}</small>
+                <small v-if="step.tokens" class="step-tokens">{{ formatTokens(step.tokens) }} tokens</small>
               </div>
             </article>
           </div>
@@ -3307,14 +3258,13 @@ function formatTime(value: string): string {
           <details class="technical-details">
             <summary>查看技术详情 · {{ visibleProgressEvents.length }} 条事件</summary>
             <div class="embedded-timeline live-timeline">
-              <article
-                v-for="(event, index) in visibleProgressEvents"
-                :key="event.sequence"
-                :class="{ current: index === visibleProgressEvents.length - 1 }"
-              >
+              <article v-for="(event, index) in visibleProgressEvents" :key="event.sequence"
+                :class="{ current: index === visibleProgressEvents.length - 1 }">
                 <i></i>
                 <time>{{ formatTime(event.occurred_at) }}</time>
-                <div><strong>{{ eventStage(event) }}</strong><p>{{ eventMessage(event) }}</p></div>
+                <div><strong>{{ eventStage(event) }}</strong>
+                  <p>{{ eventMessage(event) }}</p>
+                </div>
               </article>
             </div>
           </details>

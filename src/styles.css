@@ -275,6 +275,10 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+.conversation-tokens {
+  font-size: 12px;
+  color: var(--muted);
+}
 .crumb { color: var(--muted); font-size: 12px; }
 .chat-topbar strong { font-size: 15px; }
 .trace-restore-button {
@@ -507,6 +511,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 .agent-message-header .status-failed { color: #a93631; background: #fff0ef; }
 .agent-message-header .status-completed { color: #087b6f; background: #e8faf6; }
 .agent-message-header .status-cancelled { color: #687386; background: #eef1f6; }
+.agent-message-header .historical-tokens { color: #98a2b3; font: 11px Consolas, monospace; }
 .approval-card {
   margin-top: 14px;
   padding: 16px;
@@ -781,6 +786,27 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
   min-height: 34px;
   margin-top: 6px;
   padding: 0 4px;
+}
+.answer-actions-buttons {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+}
+.run-token-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  font-size: 12px;
+  color: #475467;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+}
+.run-message:hover .run-token-summary {
+  opacity: 1;
+  visibility: visible;
 }
 .answer-actions button {
   display: grid;
@@ -1132,6 +1158,8 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .run-error-actions button:hover:not(:disabled) { background: #feeceb; }
 .run-error-actions button:disabled { opacity: .55; }
+.run-token-summary strong { font-size: 13px; color: #1d2939; }
+.run-token-summary small { color: #667085; margin-left: 2px; }
 .run-cancelled {
   display: flex;
   align-items: center;
@@ -1719,6 +1747,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .process-step p { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .process-step small { display: block; margin-top: 4px; color: #7c8798; font: 10px/1.45 Consolas, monospace; overflow-wrap: anywhere; }
+.process-step .step-tokens { display: inline-block; margin-top: 2px; color: #98a2b3; font: 10px/1.4 Consolas, monospace; }
 .process-step.is-active strong { color: var(--blue-deep); }
 .process-step.is-failed strong,
 .process-step.is-failed p { color: #a63b36; }
